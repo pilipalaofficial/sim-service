@@ -1,3 +1,8 @@
+/**
+ * 复制为 ecosystem.config.cjs 或 ecosystem.config.<env>.cjs（如 sg-lab），填写密钥与 RELAY 地址。
+ * 这些文件已加入 .gitignore，勿提交。
+ * 部署：./deploy.sh --env sg-lab 会把 ecosystem.config.sg-lab.cjs 拷到远端 ecosystem.config.cjs
+ */
 module.exports = {
   apps: [
     {
@@ -13,11 +18,12 @@ module.exports = {
         NODE_ENV: "production",
         PORT: "3500",
         LOG_LEVEL: "info",
-        // Set in shell before pm2: export SIM_SERVICE_SECRET=...  (must match gateway RELAY_SIM_SERVICE_SECRET)
-        SIM_SERVICE_SECRET: process.env.SIM_SERVICE_SECRET || "",
-        RELAY_WS_URL: "ws://127.0.0.1:8090/ws",
+        // 须与网关 RELAY_SIM_SERVICE_SECRET / relay 配置一致
+        SIM_SERVICE_SECRET: "replace-with-long-random-secret",
+        // 与 relay 同机部署可用 ws://127.0.0.1:8090/ws；跨机用 wss://your-relay.example.com/ws
+        RELAY_WS_URL: "wss://your-relay.example.com/ws",
         SIM_BOT_NAME: "SimBot",
-        SIM_DEFAULT_TICK_RATE: "20",
+        SIM_DEFAULT_TICK_RATE: "30",
         SIM_MAX_TICK_RATE: "60",
         SIM_MAX_TTL_MS: "2400000",
         SIM_IDLE_TIMEOUT_MS: "600000",
@@ -26,7 +32,7 @@ module.exports = {
         SIM_FETCH_TIMEOUT_MS: "5000",
         SIM_MAX_HTML_BYTES: "2000000",
         SIM_DEFAULT_START_ACTION: "START",
-        SIM_WARM_POOL_SIZE: "2"
+        SIM_WARM_POOL_SIZE: "2",
       },
     },
   ],

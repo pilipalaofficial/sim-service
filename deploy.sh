@@ -87,8 +87,10 @@ do_sync_code() {
   info "Syncing code to ${REMOTE_HOST}:${REMOTE_DIR}..."
   ensure_remote_dir
   rsync -avz --delete \
+    --include='ecosystem.config.example.cjs' \
+    --exclude='ecosystem.config.cjs' \
+    --exclude='ecosystem.config.*.cjs' \
     --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='.env' \
-    --exclude='ecosystem.config.sg-lab.cjs' \
     -e "${RSYNC_SSH}" \
     "${LOCAL_DIR}/" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
   ok "Code synced"

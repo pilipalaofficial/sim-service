@@ -2,7 +2,11 @@ node_modules
 dist
 .env
 .env.*
-!.env.example
 *.log
 *.pem
 .DS_Store
+
+# 本地 PM2 配置（含密钥）；仓库内仅保留 ecosystem.config.example.cjs
+ecosystem.config.cjs
+ecosystem.config.*.cjs
+!ecosystem.config.example.cjs

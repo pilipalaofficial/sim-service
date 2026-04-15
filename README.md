@@ -8,14 +8,18 @@ Server-authoritative game simulation sidecar for Sharky: loads game HTML in a sa
 - A relay instance reachable at `RELAY_WS_URL` (must match the region games use)
 - Shared secret `SIM_SERVICE_SECRET` — must match gateway `RELAY_SIM_SERVICE_SECRET` / relay config
 
-## Configuration
+## Configuration（PM2）
 
-Copy `.env.example` to `.env` and set variables (never commit `.env`).
-
-For PM2, export secrets before start, e.g.:
+复制示例并改名（已在 `.gitignore` 中，勿提交仓库）：
 
 ```bash
-export SIM_SERVICE_SECRET='your-long-random-secret'
+cp ecosystem.config.example.cjs ecosystem.config.cjs
+# 或与 deploy 一致：cp ecosystem.config.example.cjs ecosystem.config.sg-lab.cjs
+```
+
+在 `env` 里填写 `SIM_SERVICE_SECRET`（须与网关 `RELAY_SIM_SERVICE_SECRET` 一致）、`RELAY_WS_URL` 等。
+
+```bash
 pm2 start ecosystem.config.cjs
 ```
 
