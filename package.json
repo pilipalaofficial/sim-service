@@ -1,0 +1,25 @@
+{
+  "name": "sim-service",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Server-authoritative game simulation sidecar for sharky.gg",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node --import tsx src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fastify": "^5.3.3",
+    "tsx": "^4.19.4",
+    "ws": "^8.18.2",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@types/ws": "^8.18.1",
+    "pino-pretty": "^13.0.0",
+    "typescript": "^5.8.3"
+  }
+}
