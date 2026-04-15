@@ -6,7 +6,8 @@ dist
 *.pem
 .DS_Store
 
-# 本地 PM2 配置（含密钥）；仓库内仅保留 ecosystem.config.example.cjs
+# 本地 PM2 配置（含密钥）；仓库内保留 example + sg-lab 实验室模板（与 sg-lab-relay 对齐）
 ecosystem.config.cjs
 ecosystem.config.*.cjs
 !ecosystem.config.example.cjs
+!ecosystem.config.sg-lab.cjs
