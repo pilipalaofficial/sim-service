@@ -6,7 +6,7 @@
   "description": "Server-authoritative game simulation sidecar for sharky.gg",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "node --import tsx src/index.ts",
+    "start": "node dist/index.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit"
   },

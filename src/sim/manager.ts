@@ -4,8 +4,11 @@ import {
   SimSession,
   type SimSessionMode,
   type SimSessionOptions,
+  type SimSessionStats,
 } from "./session.js";
 import { SandboxWarmPool } from "./warm-pool.js";
+import { ThreadedSimSession } from "./threaded-session.js";
+import { GameSourceCache } from "./source-cache.js";
 
 export interface SimManagerLogger {
   info: (...a: unknown[]) => void;
@@ -14,18 +17,39 @@ export interface SimManagerLogger {
   debug: (...a: unknown[]) => void;
 }
 
+interface ManagedSimSession {
+  readonly id: string;
+  readonly roomKey: string;
+  readonly gameUrl: string;
+  readonly userId: string;
+  readonly active: boolean;
+  readonly mode: SimSessionMode | "stopped";
+  readonly stats: SimSessionStats;
+  onDead(cb: (session: ManagedSimSession) => void): void;
+  ensureReserved(): Promise<void>;
+  ensureActive(): Promise<void>;
+  stop(): Promise<void>;
+  isExpired(): boolean;
+}
+
 export class SimManager {
-  private sessions = new Map<string, SimSession>();
-  private inflightTransitions = new Map<string, Promise<SimSession>>();
+  private sessions = new Map<string, ManagedSimSession>();
+  private inflightTransitions = new Map<string, Promise<ManagedSimSession>>();
   private logger: SimManagerLogger;
   private gcTimer: ReturnType<typeof setInterval> | null = null;
-  private warmPool: SandboxWarmPool;
+  private warmPool: SandboxWarmPool | null;
+  private sourceCache: GameSourceCache | null;
 
   static readonly GC_INTERVAL_MS = 60_000;
 
   constructor(logger: SimManagerLogger) {
     this.logger = logger;
-    this.warmPool = new SandboxWarmPool(logger, config.sim.warmPoolSize);
+    this.warmPool = config.sim.workerThreadsEnabled
+      ? null
+      : new SandboxWarmPool(logger, config.sim.warmPoolSize);
+    this.sourceCache = config.sim.sourceCacheEnabled
+      ? new GameSourceCache(logger)
+      : null;
     this.gcTimer = setInterval(() => this.gc(), SimManager.GC_INTERVAL_MS);
   }
 
@@ -54,7 +78,7 @@ export class SimManager {
       logger?: SimManagerLogger;
       mode?: SimSessionMode;
     }
-  ): Promise<SimSession> {
+  ): Promise<ManagedSimSession> {
     const targetMode = opts.mode || "active";
     simMetrics.recordJoinRequest(targetMode);
     const inflight = this.inflightTransitions.get(roomKey);
@@ -78,21 +102,33 @@ export class SimManager {
 
     const transition = (async () => {
       const startedAt = Date.now();
-      let session = this.sessions.get(roomKey);
+        let session = this.sessions.get(roomKey);
       let createdSession = false;
       if (!session || !session.active) {
         if (session && !session.active) {
           this.sessions.delete(roomKey);
         }
-        session = new SimSession({
-          roomKey,
-          gameUrl: opts.gameUrl,
-          relayWsUrl: opts.relayWsUrl,
-          tickRate: opts.tickRate,
-          startAction: opts.startAction,
-          logger: opts.logger || this.logger,
-          warmPool: this.warmPool,
-        });
+        const preparedSource = await this.prepareSource(opts.gameUrl);
+        session = config.sim.workerThreadsEnabled
+          ? new ThreadedSimSession({
+              roomKey,
+              gameUrl: opts.gameUrl,
+              relayWsUrl: opts.relayWsUrl,
+              tickRate: opts.tickRate,
+              startAction: opts.startAction,
+              preparedSource,
+              logger: opts.logger || this.logger,
+            })
+          : new SimSession({
+              roomKey,
+              gameUrl: opts.gameUrl,
+              relayWsUrl: opts.relayWsUrl,
+              tickRate: opts.tickRate,
+              startAction: opts.startAction,
+              preparedSource,
+              logger: opts.logger || this.logger,
+              warmPool: this.warmPool || undefined,
+            });
         session.onDead((s) => {
           this.logger.warn(
             `[sim-manager] session dead room=${s.roomKey} id=${s.id}`
@@ -168,7 +204,7 @@ export class SimManager {
     return true;
   }
 
-  getSession(roomKey: string): SimSession | undefined {
+  getSession(roomKey: string): ManagedSimSession | undefined {
     return this.sessions.get(roomKey);
   }
 
@@ -192,7 +228,21 @@ export class SimManager {
       reservedSims,
       activeSims,
       warmingSims: this.inflightTransitions.size,
-      warmPool: this.warmPool.status,
+      warmPool: this.warmPool
+        ? this.warmPool.status
+        : { configuredSlots: 0, warmSlots: 0 },
+      sourceCache: this.sourceCache
+        ? this.sourceCache.status
+        : {
+            enabled: false,
+            entries: 0,
+            inflight: 0,
+            bytes: 0,
+            maxEntries: 0,
+            maxBytes: 0,
+            ttlMs: 0,
+          },
+      workerThreadsEnabled: config.sim.workerThreadsEnabled,
     };
   }
 
@@ -209,7 +259,7 @@ export class SimManager {
   }
 
   private async ensureSessionMode(
-    session: SimSession,
+    session: ManagedSimSession,
     targetMode: SimSessionMode
   ): Promise<void> {
     if (targetMode === "reserve") {
@@ -217,5 +267,12 @@ export class SimManager {
       return;
     }
     await session.ensureActive();
+  }
+
+  private async prepareSource(gameUrl: string) {
+    if (!this.sourceCache) {
+      return null;
+    }
+    return this.sourceCache.getOrLoad(gameUrl);
   }
 }

@@ -8,6 +8,7 @@ import { config } from "../config.js";
 import {
   loadSimRuntime,
   type LoadedSimRuntime,
+  type PreparedGameSource,
   type SimSandboxLogger,
 } from "./sandbox.js";
 import type { SandboxWarmPool } from "./warm-pool.js";
@@ -20,6 +21,7 @@ export interface SimSessionOptions {
   startAction?: string;
   logger: SimSandboxLogger;
   warmPool?: SandboxWarmPool;
+  preparedSource?: PreparedGameSource | null;
 }
 
 export type SimSessionMode = "reserve" | "active";
@@ -30,6 +32,32 @@ type SimLifecycle =
   | "activating"
   | "active"
   | "stopped";
+
+export interface SimSessionStats {
+  id: string;
+  roomKey: string;
+  gameUrl: string;
+  userId: string;
+  active: boolean;
+  mode: SimSessionMode | "stopped";
+  lifecycle: SimLifecycle;
+  tickRate: number;
+  phase: "lobby" | "playing" | "result";
+  relay: boolean;
+  relayDisconnects: number;
+  queuedActions: number;
+  players: number;
+  stateBytes: number;
+  startedAt: number;
+  reservedAt: number;
+  activatedAt: number;
+  uptimeMs: number;
+  idleMs: number;
+  htmlSize: number;
+  observedAt: number;
+  workerIsolation?: boolean;
+  workerThreadId?: number;
+}
 
 interface SimPlayerInfo {
   user_id: string;
@@ -43,6 +71,7 @@ interface SimPlayerInfo {
 interface QueuedAction {
   action: Record<string, any>;
   userId: string;
+  inputId: number | null;
 }
 
 const BOT_PREFIXES = ["ai-agent-", "stream-bot-", "sim-bot-"];
@@ -99,6 +128,19 @@ function safeClone<T>(v: T): T {
   }
 }
 
+function normalizeInputId(raw: unknown): number | null {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return Math.floor(raw);
+  }
+  if (typeof raw === "string") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return null;
+}
+
 export class SimSession {
   readonly id: string;
   readonly roomKey: string;
@@ -108,6 +150,7 @@ export class SimSession {
   private relayClient: RelayClient;
   private runtime: LoadedSimRuntime | null = null;
   private gameConfig: Record<string, any> | null = null;
+  private preparedSource: PreparedGameSource | null;
   private logger: SimSandboxLogger;
   private warmPool: SandboxWarmPool | null;
   private lifecycle: SimLifecycle = "new";
@@ -123,11 +166,13 @@ export class SimSession {
   private state: Record<string, any> = { players: {}, _phase: "lobby" };
   private players: Record<string, SimPlayerInfo> = {};
   private actionQueue: QueuedAction[] = [];
+  private lastProcessedInputs: Record<string, number> = {};
   private lastStateDigest = "";
   private pendingSync = false;
   private simCtx: Record<string, any>;
   private relayHandlersBound = false;
   private _onDeadCallbacks: Array<(session: SimSession) => void> = [];
+  private _runtimeConsecutiveOverruns = 0;
 
   static readonly MAX_RELAY_DISCONNECTS = 6;
 
@@ -138,6 +183,7 @@ export class SimSession {
     this.userId = `sim-bot-${this.id.slice(0, 8)}`;
     this.logger = opts.logger;
     this.warmPool = opts.warmPool || null;
+    this.preparedSource = opts.preparedSource || null;
     this.tickRate = clampTickRate(opts.tickRate ?? config.sim.defaultTickRate);
     this.startAction =
       String(opts.startAction || config.sim.defaultStartAction || "START") ||
@@ -187,8 +233,13 @@ export class SimSession {
     this.lifecycle = "reserving";
 
     const seed = this.warmPool?.acquire() || null;
+    const preparedSource = this.preparedSource;
+    this.preparedSource = null;
     try {
-      this.runtime = await loadSimRuntime(this.gameUrl, this.logger, { seed });
+      this.runtime = await loadSimRuntime(this.gameUrl, this.logger, {
+        seed,
+        preparedSource,
+      });
       if (this.isStopped()) {
         throw new Error(`sim session stopped during reserve room=${this.roomKey}`);
       }
@@ -291,7 +342,7 @@ export class SimSession {
     return false;
   }
 
-  get stats() {
+  get stats(): SimSessionStats {
     return {
       id: this.id,
       roomKey: this.roomKey,
@@ -313,10 +364,12 @@ export class SimSession {
       uptimeMs: this.active ? Date.now() - this._startedAt : 0,
       idleMs: Date.now() - this._lastEventAt,
       htmlSize: this.runtime?.htmlSize ?? 0,
+      observedAt: Date.now(),
     };
   }
 
-  private markDead(): void {
+  private markDead(reason = "unknown"): void {
+    this.logger.error(`[sim] marking session dead room=${this.roomKey} reason=${reason}`);
     this.stop().catch(() => {});
     for (const cb of this._onDeadCallbacks) {
       try {
@@ -333,6 +386,38 @@ export class SimSession {
 
   private isFullyActive(): boolean {
     return this.lifecycle === "active";
+  }
+
+  private observeRuntimeBudget(
+    kind: "onAction" | "onTick",
+    startedAtMs: number,
+    details: Record<string, any> = {}
+  ): void {
+    const durationMs = Date.now() - startedAtMs;
+    const warnMs = Math.max(1, config.sim.runtimeStepWarnMs || 1);
+    const hardMs = Math.max(warnMs, config.sim.runtimeStepHardMs || warnMs);
+    const maxOverruns = Math.max(1, config.sim.runtimeMaxOverruns || 1);
+
+    if (durationMs >= hardMs) {
+      this._runtimeConsecutiveOverruns += 1;
+      this.logger.error(
+        `[sim] runtime step over budget room=${this.roomKey} kind=${kind} duration_ms=${durationMs} consecutive=${this._runtimeConsecutiveOverruns} details=${JSON.stringify(details)}`
+      );
+      if (
+        durationMs >= hardMs * 4 ||
+        this._runtimeConsecutiveOverruns >= maxOverruns
+      ) {
+        this.markDead("runtime_step_over_budget");
+      }
+      return;
+    }
+
+    this._runtimeConsecutiveOverruns = 0;
+    if (durationMs >= warnMs) {
+      this.logger.warn(
+        `[sim] runtime step slow room=${this.roomKey} kind=${kind} duration_ms=${durationMs} details=${JSON.stringify(details)}`
+      );
+    }
   }
 
   private bindRelayHandlers(): void {
@@ -363,7 +448,7 @@ export class SimSession {
         this.logger.error(
           `[sim] relay disconnected too many times room=${this.roomKey}, marking dead`
         );
-        this.markDead();
+        this.markDead("relay_disconnect_threshold");
       }
     });
   }
@@ -394,12 +479,12 @@ export class SimSession {
         self.state?.players?.[String(userId)] || null,
       canStartGame: () => Object.keys(self.state?.players || {}).length > 0,
       requestStartGame: () => {
-        self.enqueueAction({ type: self.startAction }, self.userId);
+        self.enqueueAction({ type: self.startAction }, self.userId, null);
         return true;
       },
       sendAction: (action: unknown) => {
         if (!action || typeof action !== "object") return false;
-        self.enqueueAction(action as Record<string, any>, self.userId);
+        self.enqueueAction(action as Record<string, any>, self.userId, null);
         return true;
       },
       hasWorldSpace: () => false,
@@ -562,8 +647,11 @@ export class SimSession {
             ""
         );
         const action = relayPayload.action || relayPayload;
+        const inputId = normalizeInputId(
+          action?.input_id ?? relayPayload?.input_id ?? raw.input_id
+        );
         if (!sourceUserId) return;
-        this.enqueueAction(action, sourceUserId);
+        this.enqueueAction(action, sourceUserId, inputId);
         this.drainActionQueue();
         this.pushStateSyncIfChanged("player_action");
         return;
@@ -590,6 +678,7 @@ export class SimSession {
         const userId = String(p.user_id || "");
         if (!userId) return;
         delete this.players[userId];
+        delete this.lastProcessedInputs[userId];
         if (this.state?.players && this.state.players[userId]) {
           delete this.state.players[userId];
         }
@@ -601,17 +690,34 @@ export class SimSession {
     }
   }
 
-  private enqueueAction(action: Record<string, any>, userId: string): void {
+  private enqueueAction(
+    action: Record<string, any>,
+    userId: string,
+    inputId: number | null
+  ): void {
     const packed =
       action && typeof action === "object"
         ? ({ ...action } as Record<string, any>)
         : { type: String(action || "") };
-    this.actionQueue.push({ action: packed, userId });
+    this.actionQueue.push({ action: packed, userId, inputId });
     this._lastEventAt = Date.now();
+  }
+
+  private ackProcessedInput(userId: string, inputId: number | null): void {
+    if (!userId || inputId === null) return;
+    const prev = this.lastProcessedInputs[userId] || 0;
+    if (inputId > prev) {
+      this.lastProcessedInputs[userId] = inputId;
+    }
   }
 
   private drainActionQueue(): void {
     if (!this.gameConfig || typeof this.gameConfig.onAction !== "function") {
+      while (this.actionQueue.length > 0) {
+        const item = this.actionQueue.shift();
+        if (!item) continue;
+        this.ackProcessedInput(item.userId, item.inputId);
+      }
       this.actionQueue.length = 0;
       return;
     }
@@ -631,6 +737,7 @@ export class SimSession {
         this.setPhase("lobby");
       }
 
+      const startedAtMs = Date.now();
       try {
         const next = this.gameConfig.onAction(
           this.state,
@@ -646,8 +753,17 @@ export class SimSession {
           `[sim] onAction error room=${this.roomKey} action=${kind} user=${item.userId}`,
           err
         );
+      } finally {
+        this.ackProcessedInput(item.userId, item.inputId);
+        this.observeRuntimeBudget("onAction", startedAtMs, {
+          action: kind,
+          userId: item.userId,
+        });
       }
       this.ensureStateShape();
+      if (this.isStopped()) {
+        return;
+      }
     }
   }
 
@@ -665,6 +781,7 @@ export class SimSession {
       typeof this.gameConfig.onTick === "function"
     ) {
       const dtSec = 1 / this.tickRate;
+      const startedAtMs = Date.now();
       try {
         const next = this.gameConfig.onTick(this.state, dtSec, this.simCtx);
         if (next && typeof next === "object" && next !== this.state) {
@@ -672,7 +789,15 @@ export class SimSession {
         }
       } catch (err) {
         this.logger.warn(`[sim] onTick error room=${this.roomKey}`, err);
+      } finally {
+        this.observeRuntimeBudget("onTick", startedAtMs, {
+          phase: this.phase,
+          dt_ms: Math.round(dtSec * 1000),
+        });
       }
+    }
+    if (this.isStopped()) {
+      return;
     }
     this.ensureStateShape();
     this.pushStateSyncIfChanged("tick");
@@ -720,7 +845,11 @@ export class SimSession {
     this.syncPlayersToState();
     const snapshot = safeClone(this.state);
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
-      return { players: {}, _phase: this.phase };
+      return {
+        players: {},
+        _phase: this.phase,
+        _last_processed_inputs: { ...this.lastProcessedInputs },
+      };
     }
     if (
       !snapshot.players ||
@@ -730,6 +859,9 @@ export class SimSession {
       snapshot.players = {};
     }
     snapshot._phase = this.phase;
+    if (Object.keys(this.lastProcessedInputs).length > 0) {
+      snapshot._last_processed_inputs = { ...this.lastProcessedInputs };
+    }
     return snapshot;
   }
 

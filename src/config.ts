@@ -29,7 +29,24 @@ export const config = {
     ),
     fetchTimeoutMs: parseInt(env("SIM_FETCH_TIMEOUT_MS", "5000")),
     maxHtmlBytes: parseInt(env("SIM_MAX_HTML_BYTES", "2000000")),
+    sourceCacheEnabled:
+      env("SIM_SOURCE_CACHE_ENABLED", "1").trim() !== "0",
+    sourceCacheTtlMs: parseInt(env("SIM_SOURCE_CACHE_TTL_MS", "300000")),
+    sourceCacheMaxEntries: parseInt(
+      env("SIM_SOURCE_CACHE_MAX_ENTRIES", "64")
+    ),
+    sourceCacheMaxBytes: parseInt(
+      env("SIM_SOURCE_CACHE_MAX_BYTES", "33554432")
+    ),
     defaultStartAction: env("SIM_DEFAULT_START_ACTION", "START"),
     warmPoolSize: parseInt(env("SIM_WARM_POOL_SIZE", "2")),
+    workerThreadsEnabled:
+      env("SIM_WORKER_THREADS_ENABLED", "0").trim() !== "0",
+    workerStatsIntervalMs: parseInt(
+      env("SIM_WORKER_STATS_INTERVAL_MS", "1000")
+    ),
+    runtimeStepWarnMs: parseInt(env("SIM_RUNTIME_STEP_WARN_MS", "25")),
+    runtimeStepHardMs: parseInt(env("SIM_RUNTIME_STEP_HARD_MS", "120")),
+    runtimeMaxOverruns: parseInt(env("SIM_RUNTIME_MAX_OVERRUNS", "2")),
   },
 } as const;

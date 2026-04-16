@@ -128,9 +128,19 @@ export interface SimMetricsSnapshot {
   reservedSims: number;
   activeSims: number;
   warmingSims: number;
+  workerThreadsEnabled?: boolean;
   warmPool: {
     configuredSlots: number;
     warmSlots: number;
+  };
+  sourceCache: {
+    enabled: boolean;
+    entries: number;
+    inflight: number;
+    bytes: number;
+    maxEntries: number;
+    maxBytes: number;
+    ttlMs: number;
   };
 }
 
@@ -163,6 +173,22 @@ export class SimMetrics {
     [],
     [100, 500, 1000, 5000, 15000, 30000, 60000, 120000, 300000]
   );
+  private readonly sourceCacheLookup = new CounterVec(
+    "sim_source_cache_requests_total",
+    "Total sim source cache lookups by result.",
+    ["result"]
+  );
+  private readonly sourceCacheEvictions = new CounterVec(
+    "sim_source_cache_evictions_total",
+    "Total sim source cache evictions by reason.",
+    ["reason"]
+  );
+  private readonly sourceCacheLoadMs = new HistogramVec(
+    "sim_source_cache_load_ms",
+    "Time spent loading uncached sim game source payloads in milliseconds.",
+    [],
+    [10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+  );
 
   recordJoinRequest(mode: "reserve" | "active"): void {
     this.joinRequests.inc({ mode });
@@ -181,6 +207,18 @@ export class SimMetrics {
     this.reserveToActiveMs.observe({}, value);
   }
 
+  recordSourceCacheLookup(result: "hit" | "miss" | "wait" | "bypass"): void {
+    this.sourceCacheLookup.inc({ result });
+  }
+
+  recordSourceCacheEviction(reason: "expired" | "capacity"): void {
+    this.sourceCacheEvictions.inc({ reason });
+  }
+
+  observeSourceCacheLoadMs(value: number): void {
+    this.sourceCacheLoadMs.observe({}, value);
+  }
+
   render(snapshot: SimMetricsSnapshot): string {
     const gaugeLines = [
       "# HELP sim_sessions Current sim session counts by mode.",
@@ -193,6 +231,18 @@ export class SimMetrics {
       "# TYPE sim_warm_pool_slots gauge",
       `sim_warm_pool_slots{state="configured"} ${snapshot.warmPool.configuredSlots}`,
       `sim_warm_pool_slots{state="ready"} ${snapshot.warmPool.warmSlots}`,
+      "# HELP sim_worker_threads_enabled Whether sim room isolation via Worker Threads is enabled.",
+      "# TYPE sim_worker_threads_enabled gauge",
+      `sim_worker_threads_enabled ${snapshot.workerThreadsEnabled ? 1 : 0}`,
+      "# HELP sim_source_cache_state Current sim game source cache state.",
+      "# TYPE sim_source_cache_state gauge",
+      `sim_source_cache_state{metric="enabled"} ${snapshot.sourceCache.enabled ? 1 : 0}`,
+      `sim_source_cache_state{metric="entries"} ${snapshot.sourceCache.entries}`,
+      `sim_source_cache_state{metric="inflight"} ${snapshot.sourceCache.inflight}`,
+      `sim_source_cache_state{metric="bytes"} ${snapshot.sourceCache.bytes}`,
+      `sim_source_cache_state{metric="max_entries"} ${snapshot.sourceCache.maxEntries}`,
+      `sim_source_cache_state{metric="max_bytes"} ${snapshot.sourceCache.maxBytes}`,
+      `sim_source_cache_state{metric="ttl_ms"} ${snapshot.sourceCache.ttlMs}`,
     ];
 
     return [
@@ -202,6 +252,9 @@ export class SimMetrics {
       ...this.reservePrepMs.render(),
       ...this.activationMs.render(),
       ...this.reserveToActiveMs.render(),
+      ...this.sourceCacheLookup.render(),
+      ...this.sourceCacheEvictions.render(),
+      ...this.sourceCacheLoadMs.render(),
       "",
     ].join("\n");
   }

@@ -15,6 +15,13 @@ export interface LoadedSimRuntime {
   htmlSize: number;
 }
 
+export interface PreparedGameSource {
+  gameUrl: string;
+  htmlSize: number;
+  scripts: string[];
+  preparedAt: number;
+}
+
 export interface SimSandboxSeed {
   context: vm.Context;
   globals: Record<string, any>;
@@ -62,6 +69,22 @@ function extractInlineScripts(html: string): string[] {
   return blocks;
 }
 
+function prepareGameSource(gameUrl: string, html: string): PreparedGameSource {
+  if (!/__DELTA_GAME_CONFIG__/.test(html)) {
+    throw new Error("game html does not define __DELTA_GAME_CONFIG__");
+  }
+  const scripts = extractInlineScripts(html);
+  if (scripts.length === 0) {
+    throw new Error("game html has no inline scripts");
+  }
+  return {
+    gameUrl,
+    htmlSize: html.length,
+    scripts,
+    preparedAt: Date.now(),
+  };
+}
+
 async function fetchGameHtml(gameUrl: string): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.sim.fetchTimeoutMs);
@@ -90,6 +113,45 @@ async function fetchGameHtml(gameUrl: string): Promise<string> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function fetchPreparedGameSource(
+  gameUrl: string
+): Promise<PreparedGameSource> {
+  const html = await fetchGameHtml(gameUrl);
+  return prepareGameSource(gameUrl, html);
+}
+
+export function clonePreparedGameSource(
+  source: PreparedGameSource
+): PreparedGameSource {
+  return {
+    gameUrl: String(source.gameUrl || ""),
+    htmlSize: Number(source.htmlSize || 0),
+    scripts: Array.isArray(source.scripts)
+      ? source.scripts.map((s) => String(s || ""))
+      : [],
+    preparedAt: Number(source.preparedAt || Date.now()),
+  };
+}
+
+export function getPreparedGameSourceSize(source: PreparedGameSource): number {
+  return source.scripts.reduce(
+    (sum, script) => sum + Buffer.byteLength(String(script || ""), "utf8"),
+    0
+  );
+}
+
+function getPreparedSourceForGame(
+  gameUrl: string,
+  preparedSource?: PreparedGameSource | null
+): PreparedGameSource | null {
+  if (!preparedSource || typeof preparedSource !== "object") return null;
+  if (String(preparedSource.gameUrl || "") !== gameUrl) return null;
+  if (!Array.isArray(preparedSource.scripts) || preparedSource.scripts.length === 0) {
+    return null;
+  }
+  return clonePreparedGameSource(preparedSource);
 }
 
 function createSandboxGlobals(logger: SimSandboxLogger): Record<string, any> {
@@ -183,16 +245,18 @@ export function createSandboxSeed(logger: SimSandboxLogger): SimSandboxSeed {
 export async function loadSimRuntime(
   gameUrl: string,
   logger: SimSandboxLogger,
-  opts?: { seed?: SimSandboxSeed | null }
+  opts?: {
+    seed?: SimSandboxSeed | null;
+    preparedSource?: PreparedGameSource | null;
+  }
 ): Promise<LoadedSimRuntime> {
-  const html = await fetchGameHtml(gameUrl);
-  if (!/__DELTA_GAME_CONFIG__/.test(html)) {
-    throw new Error("game html does not define __DELTA_GAME_CONFIG__");
-  }
-  const scripts = extractInlineScripts(html);
-  if (scripts.length === 0) {
-    throw new Error("game html has no inline scripts");
-  }
+  const inlinePreparedSource = getPreparedSourceForGame(
+    gameUrl,
+    opts?.preparedSource
+  );
+  const preparedSource =
+    inlinePreparedSource || (await fetchPreparedGameSource(gameUrl));
+  const scripts = preparedSource.scripts;
 
   const seed = opts?.seed || createSandboxSeed(logger);
   const globals = seed.globals;
@@ -222,13 +286,13 @@ export async function loadSimRuntime(
   }
 
   logger.info(
-    `[sim-sandbox] loaded game config from ${gameUrl} (scripts=${scripts.length}, executed=${executed})`
+    `[sim-sandbox] loaded game config from ${gameUrl} (scripts=${scripts.length}, executed=${executed}, source=${inlinePreparedSource ? "preloaded" : "fetched"})`
   );
 
   return {
     gameConfig: gameConfig as Record<string, any>,
     context,
     globals,
-    htmlSize: html.length,
+    htmlSize: preparedSource.htmlSize,
   };
 }
