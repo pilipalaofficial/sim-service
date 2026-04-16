@@ -56,14 +56,22 @@ type WorkerInboundMessage =
 interface PendingRequest {
   resolve: (stats: SimSessionStats) => void;
   reject: (err: Error) => void;
+  command: WorkerCommandMessage["command"];
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 function getWorkerModuleURL(): URL {
-  const ext = import.meta.url.endsWith(".ts") ? "ts" : "js";
-  return new URL(`./threaded-session-worker.${ext}`, import.meta.url);
+  const useTsWorker = import.meta.url.endsWith(".ts");
+  return new URL(
+    useTsWorker ? "./threaded-session-worker.ts" : "./threaded-session-worker.js",
+    import.meta.url
+  );
 }
 
 function getWorkerExecArgv(): string[] {
+  if (import.meta.url.endsWith(".ts")) {
+    return ["--import", "tsx"];
+  }
   const filtered: string[] = [];
   for (let i = 0; i < process.execArgv.length; i++) {
     const arg = process.execArgv[i];
@@ -105,6 +113,8 @@ export class ThreadedSimSession {
   private _userId = "";
   private _threadId = 0;
   private _stats: SimSessionStats;
+  private lastMessageAt = Date.now();
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     opts: Omit<SimSessionOptions, "logger" | "warmPool">
@@ -176,6 +186,8 @@ export class ThreadedSimSession {
       this.failAll(new Error(`sim worker exited with code ${code}`));
       this.notifyDead(reason);
     });
+
+    this.startWatchdog();
   }
 
   get id(): string {
@@ -252,7 +264,22 @@ export class ThreadedSimSession {
     }
     const requestId = ++this.requestSeq;
     return new Promise<SimSessionStats>((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
+      const timeoutMs = Math.max(
+        1000,
+        config.sim.workerUnresponsiveTimeoutMs || 5000
+      );
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(requestId);
+        if (!pending) return;
+        this.pending.delete(requestId);
+        pending.reject(
+          new Error(
+            `sim worker command timeout room=${this.roomKey} command=${command}`
+          )
+        );
+        this.forceTerminate(`worker_command_timeout:${command}`);
+      }, timeoutMs);
+      this.pending.set(requestId, { resolve, reject, command, timer });
       this.worker.postMessage({
         type: "command",
         requestId,
@@ -263,6 +290,7 @@ export class ThreadedSimSession {
 
   private handleMessage(msg: WorkerInboundMessage): void {
     if (!msg || typeof msg !== "object") return;
+    this.touch();
     switch (msg.type) {
       case "ready":
         this._id = msg.sessionId;
@@ -278,6 +306,9 @@ export class ThreadedSimSession {
         const pending = this.pending.get(msg.requestId);
         if (!pending) return;
         this.pending.delete(msg.requestId);
+        if (pending.timer) {
+          clearTimeout(pending.timer);
+        }
         if (msg.stats) {
           this.updateStats(msg.stats);
         }
@@ -320,14 +351,51 @@ export class ThreadedSimSession {
       this.rejectReady(err);
     }
     for (const pending of this.pending.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
       pending.reject(err);
     }
     this.pending.clear();
   }
 
+  private touch(): void {
+    this.lastMessageAt = Date.now();
+  }
+
+  private startWatchdog(): void {
+    const timeoutMs = Math.max(
+      1000,
+      config.sim.workerUnresponsiveTimeoutMs || 5000
+    );
+    const intervalMs = Math.max(250, Math.min(1000, Math.floor(timeoutMs / 2)));
+    this.watchdogTimer = setInterval(() => {
+      if (this.terminated) return;
+      if (Date.now() - this.lastMessageAt <= timeoutMs) return;
+      this.forceTerminate("worker_unresponsive");
+    }, intervalMs);
+  }
+
+  private clearWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private forceTerminate(reason: string): void {
+    if (this.terminated) return;
+    this.logger.error(
+      `[sim-worker] force terminate room=${this.roomKey} reason=${reason}`
+    );
+    this.notifyDead(reason);
+  }
+
   private notifyDead(reason: string): void {
     if (this.terminated) return;
     this.terminated = true;
+    this.clearWatchdog();
+    this.failAll(new Error(`sim worker dead room=${this.roomKey} reason=${reason}`));
     this._stats = {
       ...this._stats,
       active: false,
@@ -353,6 +421,7 @@ export class ThreadedSimSession {
   private async terminateWorker(): Promise<void> {
     if (this.terminated) return;
     this.terminated = true;
+    this.clearWatchdog();
     this.failAll(new Error(`sim worker terminated room=${this.roomKey}`));
     await this.worker.terminate();
     this._stats = {

@@ -45,6 +45,9 @@ export const config = {
     workerStatsIntervalMs: parseInt(
       env("SIM_WORKER_STATS_INTERVAL_MS", "1000")
     ),
+    workerUnresponsiveTimeoutMs: parseInt(
+      env("SIM_WORKER_UNRESPONSIVE_TIMEOUT_MS", "5000")
+    ),
     runtimeStepWarnMs: parseInt(env("SIM_RUNTIME_STEP_WARN_MS", "25")),
     runtimeStepHardMs: parseInt(env("SIM_RUNTIME_STEP_HARD_MS", "120")),
     runtimeMaxOverruns: parseInt(env("SIM_RUNTIME_MAX_OVERRUNS", "2")),
