@@ -1,3 +1,8 @@
+const simPm2MaxMemoryRestart =
+  process.env.SIM_PM2_MAX_MEMORY_RESTART || "4G";
+const simNodeArgs =
+  process.env.SIM_NODE_ARGS || "--max-old-space-size=3072";
+
 /**
  * 复制为 ecosystem.config.cjs 或 ecosystem.config.<env>.cjs（如 sg-lab），填写密钥与 RELAY 地址。
  * 这些文件已加入 .gitignore，勿提交。
@@ -9,10 +14,11 @@ module.exports = {
       name: "sim-service",
       script: "dist/index.js",
       interpreter: "node",
+      node_args: simNodeArgs,
       instances: 1,
       exec_mode: "fork",
       autorestart: true,
-      max_memory_restart: "300M",
+      max_memory_restart: simPm2MaxMemoryRestart,
       env: {
         NODE_ENV: "production",
         PORT: "3500",
