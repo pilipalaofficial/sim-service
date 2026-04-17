@@ -154,6 +154,24 @@ function safeClone<T>(v: T): T {
   }
 }
 
+function shallowCloneRecord(
+  value: Record<string, any> | null | undefined
+): Record<string, any> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return { ...value };
+}
+
+function fingerprintJson(json: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < json.length; i += 1) {
+    hash ^= json.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${json.length}:${(hash >>> 0).toString(16)}`;
+}
+
 function normalizeInputId(raw: unknown): number | null {
   if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
     return Math.floor(raw);
@@ -184,6 +202,7 @@ export class SimSession {
   private _reservedAt = 0;
   private _activatedAt = 0;
   private _lastEventAt = 0;
+  private _lastRelayMessageAt = 0;
   private _relayDisconnectCount = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRate: number;
@@ -194,7 +213,10 @@ export class SimSession {
   private players: Record<string, SimPlayerInfo> = {};
   private actionQueue: QueuedAction[] = [];
   private lastProcessedInputs: Record<string, number> = {};
-  private lastStateDigest = "";
+  private lastProcessedInputsSnapshot: Record<string, number> = {};
+  private lastProcessedInputsDirty = false;
+  private lastStateFingerprint = "";
+  private lastStateBytes = 0;
   private pendingSync = false;
   private lastStateSyncAt = 0;
   private lastSyncedPhase: "lobby" | "playing" | "result" | "" = "";
@@ -204,6 +226,9 @@ export class SimSession {
   private _runtimeConsecutiveOverruns = 0;
 
   static readonly MAX_RELAY_DISCONNECTS = 6;
+  // Max window for tick-driven idle refresh: if no real relay message arrived
+  // within this window, stop refreshing _lastEventAt so orphan rooms still GC.
+  static readonly IDLE_TICK_REFRESH_WINDOW_MS = 60_000;
 
   constructor(opts: SimSessionOptions) {
     this.id = randomUUID();
@@ -389,7 +414,7 @@ export class SimSession {
       relayDisconnects: this._relayDisconnectCount,
       queuedActions: this.actionQueue.length,
       players: Object.keys(this.players).length,
-      stateBytes: this.lastStateDigest.length,
+      stateBytes: this.lastStateBytes,
       startedAt: this._startedAt,
       reservedAt: this._reservedAt,
       activatedAt: this._activatedAt,
@@ -458,14 +483,17 @@ export class SimSession {
     }
     this.relayHandlersBound = true;
 
-    this.relayClient.on("bootstrap", (bs: NetworkBootstrap) =>
-      this.handleBootstrap(bs)
-    );
-    this.relayClient.on("message", (msg: RelayMessage) =>
-      this.handleRelayMessage(msg)
-    );
+    this.relayClient.on("bootstrap", (bs: NetworkBootstrap) => {
+      this._lastRelayMessageAt = Date.now();
+      this.handleBootstrap(bs);
+    });
+    this.relayClient.on("message", (msg: RelayMessage) => {
+      this._lastRelayMessageAt = Date.now();
+      this.handleRelayMessage(msg);
+    });
     this.relayClient.on("connected", () => {
       this._relayDisconnectCount = 0;
+      this._lastRelayMessageAt = Date.now();
       this.flushPendingStateSync("relay_connected");
     });
     this.relayClient.on("disconnected", () => {
@@ -710,7 +738,10 @@ export class SimSession {
         const userId = String(p.user_id || "");
         if (!userId) return;
         delete this.players[userId];
-        delete this.lastProcessedInputs[userId];
+        if (this.lastProcessedInputs[userId] !== undefined) {
+          delete this.lastProcessedInputs[userId];
+          this.lastProcessedInputsDirty = true;
+        }
         if (this.state?.players && this.state.players[userId]) {
           delete this.state.players[userId];
         }
@@ -740,7 +771,22 @@ export class SimSession {
     const prev = this.lastProcessedInputs[userId] || 0;
     if (inputId > prev) {
       this.lastProcessedInputs[userId] = inputId;
+      this.lastProcessedInputsDirty = true;
     }
+  }
+
+  private getLastProcessedInputsSnapshot(): Record<string, number> | null {
+    if (this.lastProcessedInputsDirty) {
+      if (Object.keys(this.lastProcessedInputs).length > 0) {
+        this.lastProcessedInputsSnapshot = { ...this.lastProcessedInputs };
+      } else {
+        this.lastProcessedInputsSnapshot = {};
+      }
+      this.lastProcessedInputsDirty = false;
+    }
+    return Object.keys(this.lastProcessedInputsSnapshot).length > 0
+      ? this.lastProcessedInputsSnapshot
+      : null;
   }
 
   private drainActionQueue(): void {
@@ -832,6 +878,12 @@ export class SimSession {
       return;
     }
     this.ensureStateShape();
+    if (
+      this.shouldRefreshIdleOnTick() &&
+      Date.now() - this._lastEventAt >= 1000
+    ) {
+      this._lastEventAt = Date.now();
+    }
     this.pushStateSyncIfChanged("tick");
   }
 
@@ -839,6 +891,31 @@ export class SimSession {
     if (!userId || isBotUser(userId)) return false;
     if (p.role === "spectator" || p.spectator) return false;
     return p.online !== false;
+  }
+
+  private shouldRefreshIdleOnTick(): boolean {
+    if (this.phase !== "playing") return false;
+    // Only trust that humans are present if the relay is actually connected;
+    // `players[uid].online` may lag behind real disconnect events.
+    if (!this.relayClient.connected) return false;
+    // If we haven't seen ANY relay message for a while (including bootstrap /
+    // player_action / ping responses), treat the room as orphaned even if the
+    // local `players` map still looks populated.
+    if (
+      this._lastRelayMessageAt > 0 &&
+      Date.now() - this._lastRelayMessageAt >
+        SimSession.IDLE_TICK_REFRESH_WINDOW_MS
+    ) {
+      return false;
+    }
+    const hasHumanParticipants = Object.entries(this.players).some(
+      ([userId, info]) => this.shouldIncludeInGameState(userId, info)
+    );
+    if (!hasHumanParticipants) return false;
+    return (
+      !!(this.gameConfig && typeof this.gameConfig.onTick === "function") ||
+      this.gameConfig?.networkProfile?.usesContinuousTick === true
+    );
   }
 
   private syncPlayersToState(): void {
@@ -875,6 +952,7 @@ export class SimSession {
   private buildStateSnapshot(): Record<string, any> {
     this.ensureStateShape();
     this.syncPlayersToState();
+    const processedInputsSnapshot = this.getLastProcessedInputsSnapshot();
     let projectedState: Record<string, any> = this.state;
     if (
       this.gameConfig &&
@@ -892,24 +970,31 @@ export class SimSession {
         );
       }
     }
-    const snapshot = safeClone(projectedState);
-    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
-      return {
+    if (!projectedState || typeof projectedState !== "object" || Array.isArray(projectedState)) {
+      const fallbackSnapshot: Record<string, any> = {
         players: {},
         _phase: this.phase,
-        _last_processed_inputs: { ...this.lastProcessedInputs },
       };
+      if (processedInputsSnapshot) {
+        fallbackSnapshot._last_processed_inputs = processedInputsSnapshot;
+      }
+      return fallbackSnapshot;
     }
+    const snapshot = shallowCloneRecord(projectedState);
     if (
       !snapshot.players ||
       typeof snapshot.players !== "object" ||
       Array.isArray(snapshot.players)
     ) {
       snapshot.players = {};
+    } else {
+      snapshot.players = shallowCloneRecord(snapshot.players as Record<string, any>);
     }
     snapshot._phase = this.phase;
-    if (Object.keys(this.lastProcessedInputs).length > 0) {
-      snapshot._last_processed_inputs = { ...this.lastProcessedInputs };
+    if (processedInputsSnapshot) {
+      snapshot._last_processed_inputs = processedInputsSnapshot;
+    } else if ("_last_processed_inputs" in snapshot) {
+      delete snapshot._last_processed_inputs;
     }
     return snapshot;
   }
@@ -949,16 +1034,19 @@ export class SimSession {
         return;
       }
     }
-    let digest = "";
+    let snapshotJson = "";
     try {
-      digest = JSON.stringify(snapshot);
+      snapshotJson = JSON.stringify(snapshot);
     } catch {
-      digest = "";
+      snapshotJson = "";
     }
-    if (!digest) return;
-    if (digest === this.lastStateDigest && !this.pendingSync) return;
-    this.lastStateDigest = digest;
-    const sent = this.mode === "active" && this.relayClient.send("state_sync", { state: snapshot });
+    if (!snapshotJson) return;
+    const fingerprint = fingerprintJson(snapshotJson);
+    if (fingerprint === this.lastStateFingerprint && !this.pendingSync) return;
+    this.lastStateFingerprint = fingerprint;
+    this.lastStateBytes = snapshotJson.length;
+    const payload = `{"type":"state_sync","payload":{"state":${snapshotJson}}}`;
+    const sent = this.mode === "active" && this.relayClient.sendRaw(payload);
     if (!sent) {
       this.pendingSync = true;
       return;
@@ -968,7 +1056,7 @@ export class SimSession {
     this.lastSyncedPhase = snapshotPhase;
     if (reason !== "tick") {
       this.logger.debug(
-        `[sim] state_sync room=${this.roomKey} reason=${reason} bytes=${digest.length}`
+        `[sim] state_sync room=${this.roomKey} reason=${reason} bytes=${snapshotJson.length}`
       );
     }
   }

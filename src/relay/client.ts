@@ -108,8 +108,12 @@ export class RelayClient extends EventEmitter {
   }
 
   send(type: string, payload: unknown): boolean {
+    return this.sendRaw(JSON.stringify({ type, payload }));
+  }
+
+  sendRaw(serializedMessage: string): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify({ type, payload }));
+    this.ws.send(serializedMessage);
     return true;
   }
 
