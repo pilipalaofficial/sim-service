@@ -42,6 +42,7 @@ export interface SimSessionStats {
   mode: SimSessionMode | "stopped";
   lifecycle: SimLifecycle;
   tickRate: number;
+  snapshotRateHz: number;
   phase: "lobby" | "playing" | "result";
   relay: boolean;
   relayDisconnects: number;
@@ -120,6 +121,31 @@ function clampTickRate(v: number): number {
   return Math.min(Math.max(Math.round(v), 1), config.sim.maxTickRate);
 }
 
+function clampSnapshotRate(v: number, tickRate: number): number {
+  const maxRate = Math.max(1, Math.min(config.sim.maxSnapshotRate, tickRate));
+  if (!Number.isFinite(v) || v <= 0) {
+    return Math.max(1, Math.min(config.sim.defaultSnapshotRate, maxRate));
+  }
+  return Math.min(Math.max(Math.round(v), 1), maxRate);
+}
+
+function deriveSnapshotRateHz(
+  gameConfig: Record<string, any> | null,
+  tickRate: number
+): number {
+  const explicit = Number(gameConfig?.snapshotRateHz);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return clampSnapshotRate(explicit, tickRate);
+  }
+  const usesContinuousTick =
+    !!(gameConfig && typeof gameConfig.onTick === "function") ||
+    gameConfig?.networkProfile?.usesContinuousTick === true;
+  if (usesContinuousTick && tickRate > config.sim.defaultSnapshotRate) {
+    return clampSnapshotRate(config.sim.defaultSnapshotRate, tickRate);
+  }
+  return clampSnapshotRate(tickRate, tickRate);
+}
+
 function safeClone<T>(v: T): T {
   try {
     return JSON.parse(JSON.stringify(v));
@@ -161,6 +187,7 @@ export class SimSession {
   private _relayDisconnectCount = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRate: number;
+  private snapshotRateHz: number;
   private startAction: string;
   private phase: "lobby" | "playing" | "result" = "lobby";
   private state: Record<string, any> = { players: {}, _phase: "lobby" };
@@ -169,6 +196,8 @@ export class SimSession {
   private lastProcessedInputs: Record<string, number> = {};
   private lastStateDigest = "";
   private pendingSync = false;
+  private lastStateSyncAt = 0;
+  private lastSyncedPhase: "lobby" | "playing" | "result" | "" = "";
   private simCtx: Record<string, any>;
   private relayHandlersBound = false;
   private _onDeadCallbacks: Array<(session: SimSession) => void> = [];
@@ -185,6 +214,7 @@ export class SimSession {
     this.warmPool = opts.warmPool || null;
     this.preparedSource = opts.preparedSource || null;
     this.tickRate = clampTickRate(opts.tickRate ?? config.sim.defaultTickRate);
+    this.snapshotRateHz = clampSnapshotRate(this.tickRate, this.tickRate);
     this.startAction =
       String(opts.startAction || config.sim.defaultStartAction || "START") ||
       "START";
@@ -251,12 +281,13 @@ export class SimSession {
       ) {
         this.tickRate = clampTickRate(this.gameConfig.tickRate);
       }
+      this.snapshotRateHz = deriveSnapshotRateHz(this.gameConfig, this.tickRate);
 
       this.callInitState();
       this.pendingSync = true;
       this.lifecycle = "reserved";
       this.logger.info(
-        `[sim] reserved id=${this.id} room=${this.roomKey} tick_rate=${this.tickRate} game_url=${this.gameUrl}`
+        `[sim] reserved id=${this.id} room=${this.roomKey} tick_rate=${this.tickRate} snapshot_rate=${this.snapshotRateHz} game_url=${this.gameUrl}`
       );
     } catch (err) {
       if (!this.isStopped()) {
@@ -292,7 +323,7 @@ export class SimSession {
     }
     this.lifecycle = "active";
     this.logger.info(
-      `[sim] activated id=${this.id} room=${this.roomKey} tick_rate=${this.tickRate}`
+      `[sim] activated id=${this.id} room=${this.roomKey} tick_rate=${this.tickRate} snapshot_rate=${this.snapshotRateHz}`
     );
   }
 
@@ -352,6 +383,7 @@ export class SimSession {
       mode: this.mode,
       lifecycle: this.lifecycle,
       tickRate: this.tickRate,
+      snapshotRateHz: this.snapshotRateHz,
       phase: this.phase,
       relay: this.relayClient.connected,
       relayDisconnects: this._relayDisconnectCount,
@@ -843,7 +875,24 @@ export class SimSession {
   private buildStateSnapshot(): Record<string, any> {
     this.ensureStateShape();
     this.syncPlayersToState();
-    const snapshot = safeClone(this.state);
+    let projectedState: Record<string, any> = this.state;
+    if (
+      this.gameConfig &&
+      typeof this.gameConfig.buildSyncState === "function"
+    ) {
+      try {
+        const next = this.gameConfig.buildSyncState(this.state, this.simCtx);
+        if (next && typeof next === "object" && !Array.isArray(next)) {
+          projectedState = next as Record<string, any>;
+        }
+      } catch (err) {
+        this.logger.warn(
+          `[sim] buildSyncState error room=${this.roomKey}, falling back to full state`,
+          err
+        );
+      }
+    }
+    const snapshot = safeClone(projectedState);
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
       return {
         players: {},
@@ -865,8 +914,41 @@ export class SimSession {
     return snapshot;
   }
 
+  private getSnapshotIntervalMs(): number {
+    return Math.max(16, Math.floor(1000 / Math.max(1, this.snapshotRateHz)));
+  }
+
+  private shouldForceStateSync(
+    reason: string,
+    snapshotPhase: "lobby" | "playing" | "result"
+  ): boolean {
+    if (
+      reason === "bootstrap" ||
+      reason === "relay_connected" ||
+      reason === "player_joined" ||
+      reason === "player_reconnected" ||
+      reason === "player_left" ||
+      reason === "player_disconnected"
+    ) {
+      return true;
+    }
+    if (snapshotPhase !== "playing") {
+      return true;
+    }
+    return snapshotPhase !== this.lastSyncedPhase;
+  }
+
   private pushStateSyncIfChanged(reason: string): void {
     const snapshot = this.buildStateSnapshot();
+    const snapshotPhase = mapToSdkPhase(String(snapshot._phase || this.phase)) || this.phase;
+    const forceSend = this.shouldForceStateSync(reason, snapshotPhase);
+    if (!forceSend && this.mode === "active" && this.lastStateSyncAt > 0) {
+      const elapsedMs = Date.now() - this.lastStateSyncAt;
+      if (elapsedMs < this.getSnapshotIntervalMs()) {
+        this.pendingSync = true;
+        return;
+      }
+    }
     let digest = "";
     try {
       digest = JSON.stringify(snapshot);
@@ -882,6 +964,8 @@ export class SimSession {
       return;
     }
     this.pendingSync = false;
+    this.lastStateSyncAt = Date.now();
+    this.lastSyncedPhase = snapshotPhase;
     if (reason !== "tick") {
       this.logger.debug(
         `[sim] state_sync room=${this.roomKey} reason=${reason} bytes=${digest.length}`

@@ -132,6 +132,10 @@ export class ThreadedSimSession {
       mode: "reserve",
       lifecycle: "new",
       tickRate: opts.tickRate || config.sim.defaultTickRate,
+      snapshotRateHz: Math.min(
+        opts.tickRate || config.sim.defaultTickRate,
+        config.sim.defaultSnapshotRate
+      ),
       phase: "lobby",
       relay: false,
       relayDisconnects: 0,

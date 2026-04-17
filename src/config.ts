@@ -21,6 +21,8 @@ export const config = {
     botNamePrefix: env("SIM_BOT_NAME", "SimBot"),
     defaultTickRate: parseInt(env("SIM_DEFAULT_TICK_RATE", "30")),
     maxTickRate: parseInt(env("SIM_MAX_TICK_RATE", "60")),
+    defaultSnapshotRate: parseInt(env("SIM_DEFAULT_SNAPSHOT_RATE", "12")),
+    maxSnapshotRate: parseInt(env("SIM_MAX_SNAPSHOT_RATE", "30")),
     maxTtlMs: parseInt(env("SIM_MAX_TTL_MS", "2400000")),
     idleTimeoutMs: parseInt(env("SIM_IDLE_TIMEOUT_MS", "600000")),
     reserveMaxTtlMs: parseInt(env("SIM_RESERVE_MAX_TTL_MS", "120000")),

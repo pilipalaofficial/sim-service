@@ -24,6 +24,8 @@ module.exports = {
         SIM_BOT_NAME: "SimBot",
         SIM_DEFAULT_TICK_RATE: "30",
         SIM_MAX_TICK_RATE: "60",
+        SIM_DEFAULT_SNAPSHOT_RATE: "12",
+        SIM_MAX_SNAPSHOT_RATE: "30",
         SIM_MAX_TTL_MS: "2400000",
         SIM_IDLE_TIMEOUT_MS: "600000",
         SIM_RESERVE_MAX_TTL_MS: "120000",
