@@ -129,21 +129,62 @@ function clampSnapshotRate(v: number, tickRate: number): number {
   return Math.min(Math.max(Math.round(v), 1), maxRate);
 }
 
+// Predict+reconcile games need the authoritative snapshot rate to keep up with
+// the tick rate, otherwise every intermediate tick is silently dropped and
+// clients see a visible snap on each correction (common symptom: discrete grid
+// movers like snake feel extremely judder-y on every turn). These floors are
+// independent of whatever the game HTML shipped as `snapshotRateHz`, so we can
+// salvage games already published with a too-low value without republishing
+// them.
+const PREDICT_RECONCILE_SNAPSHOT_FLOOR_HZ = 15;
+const PREDICT_RECONCILE_HIGH_TICK_THRESHOLD_HZ = 20;
+
+function applyPredictReconcileSnapshotFloor(
+  requested: number,
+  gameConfig: Record<string, any> | null,
+  tickRate: number
+): number {
+  const profileClass = gameConfig?.networkProfile?.class;
+  const usesContinuousTick =
+    !!(gameConfig && typeof gameConfig.onTick === "function") ||
+    gameConfig?.networkProfile?.usesContinuousTick === true;
+  if (profileClass !== "predict_reconcile" || !usesContinuousTick) {
+    return requested;
+  }
+  // High-tick games (>= 20Hz) need snapshotRate == tickRate to stay smooth —
+  // anything less drops intermediate ticks before they ever reach the client.
+  const floor =
+    tickRate >= PREDICT_RECONCILE_HIGH_TICK_THRESHOLD_HZ
+      ? tickRate
+      : Math.min(tickRate, PREDICT_RECONCILE_SNAPSHOT_FLOOR_HZ);
+  if (requested < floor) return floor;
+  return requested;
+}
+
 function deriveSnapshotRateHz(
   gameConfig: Record<string, any> | null,
   tickRate: number
 ): number {
   const explicit = Number(gameConfig?.snapshotRateHz);
+  let requested: number;
   if (Number.isFinite(explicit) && explicit > 0) {
-    return clampSnapshotRate(explicit, tickRate);
+    requested = explicit;
+  } else {
+    const usesContinuousTick =
+      !!(gameConfig && typeof gameConfig.onTick === "function") ||
+      gameConfig?.networkProfile?.usesContinuousTick === true;
+    if (usesContinuousTick && tickRate > config.sim.defaultSnapshotRate) {
+      requested = config.sim.defaultSnapshotRate;
+    } else {
+      requested = tickRate;
+    }
   }
-  const usesContinuousTick =
-    !!(gameConfig && typeof gameConfig.onTick === "function") ||
-    gameConfig?.networkProfile?.usesContinuousTick === true;
-  if (usesContinuousTick && tickRate > config.sim.defaultSnapshotRate) {
-    return clampSnapshotRate(config.sim.defaultSnapshotRate, tickRate);
-  }
-  return clampSnapshotRate(tickRate, tickRate);
+  const raised = applyPredictReconcileSnapshotFloor(
+    requested,
+    gameConfig,
+    tickRate
+  );
+  return clampSnapshotRate(raised, tickRate);
 }
 
 function safeClone<T>(v: T): T {
@@ -202,7 +243,6 @@ export class SimSession {
   private _reservedAt = 0;
   private _activatedAt = 0;
   private _lastEventAt = 0;
-  private _lastRelayMessageAt = 0;
   private _relayDisconnectCount = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRate: number;
@@ -226,9 +266,6 @@ export class SimSession {
   private _runtimeConsecutiveOverruns = 0;
 
   static readonly MAX_RELAY_DISCONNECTS = 6;
-  // Max window for tick-driven idle refresh: if no real relay message arrived
-  // within this window, stop refreshing _lastEventAt so orphan rooms still GC.
-  static readonly IDLE_TICK_REFRESH_WINDOW_MS = 60_000;
 
   constructor(opts: SimSessionOptions) {
     this.id = randomUUID();
@@ -484,16 +521,13 @@ export class SimSession {
     this.relayHandlersBound = true;
 
     this.relayClient.on("bootstrap", (bs: NetworkBootstrap) => {
-      this._lastRelayMessageAt = Date.now();
       this.handleBootstrap(bs);
     });
     this.relayClient.on("message", (msg: RelayMessage) => {
-      this._lastRelayMessageAt = Date.now();
       this.handleRelayMessage(msg);
     });
     this.relayClient.on("connected", () => {
       this._relayDisconnectCount = 0;
-      this._lastRelayMessageAt = Date.now();
       this.flushPendingStateSync("relay_connected");
     });
     this.relayClient.on("disconnected", () => {
@@ -898,16 +932,6 @@ export class SimSession {
     // Only trust that humans are present if the relay is actually connected;
     // `players[uid].online` may lag behind real disconnect events.
     if (!this.relayClient.connected) return false;
-    // If we haven't seen ANY relay message for a while (including bootstrap /
-    // player_action / ping responses), treat the room as orphaned even if the
-    // local `players` map still looks populated.
-    if (
-      this._lastRelayMessageAt > 0 &&
-      Date.now() - this._lastRelayMessageAt >
-        SimSession.IDLE_TICK_REFRESH_WINDOW_MS
-    ) {
-      return false;
-    }
     const hasHumanParticipants = Object.entries(this.players).some(
       ([userId, info]) => this.shouldIncludeInGameState(userId, info)
     );

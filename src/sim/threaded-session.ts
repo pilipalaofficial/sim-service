@@ -68,6 +68,27 @@ function getWorkerModuleURL(): URL {
   );
 }
 
+// Node.js rejects a handful of main-process-only V8/runtime flags when they
+// appear in `new Worker({ execArgv })` (ERR_WORKER_INVALID_EXEC_ARGV). There is
+// no programmatic allow-list, so we maintain a blocklist of the flags that are
+// actually used in our deployments. Any of these on the parent process would
+// otherwise blow up every sim session spawn. Refs: nodejs/node#41103, #43991.
+const WORKER_INCOMPATIBLE_ARG_PREFIXES = [
+  "--max-old-space-size",
+  "--max-semi-space-size",
+  "--max-http-header-size",
+  "--expose-gc",
+  "--expose_gc",
+  "--title",
+];
+
+function isWorkerIncompatibleArg(arg: string): boolean {
+  for (const prefix of WORKER_INCOMPATIBLE_ARG_PREFIXES) {
+    if (arg === prefix || arg.startsWith(`${prefix}=`)) return true;
+  }
+  return false;
+}
+
 function getWorkerExecArgv(): string[] {
   if (import.meta.url.endsWith(".ts")) {
     return ["--import", "tsx"];
@@ -85,6 +106,9 @@ function getWorkerExecArgv(): string[] {
       continue;
     }
     if (arg.startsWith("--input-type=")) {
+      continue;
+    }
+    if (isWorkerIncompatibleArg(arg)) {
       continue;
     }
     filtered.push(arg);
