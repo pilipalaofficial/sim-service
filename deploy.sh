@@ -56,7 +56,7 @@ case "${DEPLOY_ENV}" in
     [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
     ;;
   us-relay-1)
-    REMOTE_HOST="54.198.135.7"
+    REMOTE_HOST="54.227.77.170"
     REMOTE_USER="ubuntu"
     SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/us-east.pem}"
     [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
