@@ -19,7 +19,7 @@ module.exports = {
         PORT: "3500",
         LOG_LEVEL: "info",
         // Must match delta2-backend/deploy/envs/sg-lab-relay.env RELAY_SIM_SERVICE_SECRET.
-        SIM_SERVICE_SECRET: "123123",
+        SIM_SERVICE_SECRET: "Q3mAO8N1A00QeralTyNGBtS3L1KaCTxudTLWQUzX5rP9mHv2cJs7nFk4bLd8yRa6",
         RELAY_WS_URL: "ws://127.0.0.1:8090/ws",
         SIM_BOT_NAME: "SimBot",
         SIM_DEFAULT_TICK_RATE: "20",

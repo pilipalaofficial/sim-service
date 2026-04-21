@@ -43,6 +43,36 @@ case "${DEPLOY_ENV}" in
     [[ -z "${REMOTE_HOST}" ]] && err "Set DEPLOY_SG_LAB_HOST (e.g. export DEPLOY_SG_LAB_HOST=1.2.3.4)"
     [[ -z "${SSH_KEY}" || ! -f "${SSH_KEY}" ]] && err "Set DEPLOY_SSH_KEY to your SSH private key path"
     ;;
+  sg-relay-1)
+    REMOTE_HOST="13.212.206.252"
+    REMOTE_USER="ubuntu"
+    SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/delta2-sg.pem}"
+    [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
+    ;;
+  sg-relay-2)
+    REMOTE_HOST="13.229.94.3"
+    REMOTE_USER="ubuntu"
+    SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/delta2-sg.pem}"
+    [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
+    ;;
+  us-relay-1)
+    REMOTE_HOST="54.198.135.7"
+    REMOTE_USER="ubuntu"
+    SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/us-east.pem}"
+    [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
+    ;;
+  us-relay-2)
+    REMOTE_HOST="3.95.170.181"
+    REMOTE_USER="ubuntu"
+    SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/us-east.pem}"
+    [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
+    ;;
+  cn-relay-1)
+    REMOTE_HOST="8.129.104.104"
+    REMOTE_USER="root"
+    SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/ali-shenzhen.pem}"
+    [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
+    ;;
   *)
     err "Unknown env '${DEPLOY_ENV}'. Add a case block to extend."
     ;;
