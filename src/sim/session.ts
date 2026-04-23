@@ -605,6 +605,34 @@ export class SimSession {
         status: "error",
         error: "askAI is unavailable in sim runtime",
       }),
+      // Mirror game-sdk.js's ctx.getGameData (game-sdk.js:4042-4046).
+      //
+      // Trivia Roulette 286a7348 incident (2026-04-23): without this,
+      // any agent code that calls ctx.getGameData(...) — typically to
+      // read inline static content like a question bank, sprite list,
+      // or seed data attached as window.__DELTA_GAME_DATA__ in the
+      // game HTML — throws TypeError on the very first line. The throw
+      // is caught silently by drainActionQueue's try/catch, but earlier
+      // mutations stick (e.g. state.gameStarted = true), so the game
+      // looks "started" but its render data (currentQuestion, etc.) is
+      // never populated → blank canvas / stuck phase.
+      //
+      // Lazy closure: simCtx is built in the constructor before
+      // loadSimRuntime returns. We read self.runtime?.globals at call
+      // time so the latest loaded sandbox globals are visible.
+      //
+      // Semantics match game-sdk.js exactly:
+      //   no data       → key ? undefined : {}
+      //   data present  → key ? data[key] : data
+      getGameData: (key?: string) => {
+        const data =
+          (self.runtime?.globals?.window as Record<string, any> | undefined)
+            ?.__DELTA_GAME_DATA__;
+        if (!data || typeof data !== "object") {
+          return key ? undefined : {};
+        }
+        return key ? (data as Record<string, any>)[key] : data;
+      },
       input: {
         up: false,
         down: false,
