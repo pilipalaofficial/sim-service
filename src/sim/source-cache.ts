@@ -54,10 +54,13 @@ export class GameSourceCache {
     };
   }
 
-  async getOrLoad(gameUrl: string): Promise<PreparedGameSource> {
+  async getOrLoad(
+    gameUrl: string,
+    fallbackGameUrl?: string
+  ): Promise<PreparedGameSource> {
     if (!config.sim.sourceCacheEnabled) {
       const startedAt = Date.now();
-      const source = await fetchPreparedGameSource(gameUrl);
+      const source = await fetchPreparedGameSource(gameUrl, fallbackGameUrl);
       simMetrics.recordSourceCacheLookup("bypass");
       simMetrics.observeSourceCacheLoadMs(Date.now() - startedAt);
       return clonePreparedGameSource(source);
@@ -78,7 +81,7 @@ export class GameSourceCache {
 
     simMetrics.recordSourceCacheLookup("miss");
     const startedAt = Date.now();
-    const loadPromise = fetchPreparedGameSource(gameUrl)
+    const loadPromise = fetchPreparedGameSource(gameUrl, fallbackGameUrl)
       .then((source) => {
         simMetrics.observeSourceCacheLoadMs(Date.now() - startedAt);
         this.put(source);

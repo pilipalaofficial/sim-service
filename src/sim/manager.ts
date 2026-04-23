@@ -102,17 +102,21 @@ export class SimManager {
 
     const transition = (async () => {
       const startedAt = Date.now();
-        let session = this.sessions.get(roomKey);
+      let session = this.sessions.get(roomKey);
       let createdSession = false;
       if (!session || !session.active) {
         if (session && !session.active) {
           this.sessions.delete(roomKey);
         }
-        const preparedSource = await this.prepareSource(opts.gameUrl);
+        const preparedSource = await this.prepareSource(
+          opts.gameUrl,
+          opts.fallbackGameUrl
+        );
         session = config.sim.workerThreadsEnabled
           ? new ThreadedSimSession({
               roomKey,
               gameUrl: opts.gameUrl,
+              fallbackGameUrl: opts.fallbackGameUrl,
               relayWsUrl: opts.relayWsUrl,
               tickRate: opts.tickRate,
               startAction: opts.startAction,
@@ -122,6 +126,7 @@ export class SimManager {
           : new SimSession({
               roomKey,
               gameUrl: opts.gameUrl,
+              fallbackGameUrl: opts.fallbackGameUrl,
               relayWsUrl: opts.relayWsUrl,
               tickRate: opts.tickRate,
               startAction: opts.startAction,
@@ -269,10 +274,10 @@ export class SimManager {
     await session.ensureActive();
   }
 
-  private async prepareSource(gameUrl: string) {
+  private async prepareSource(gameUrl: string, fallbackGameUrl?: string) {
     if (!this.sourceCache) {
       return null;
     }
-    return this.sourceCache.getOrLoad(gameUrl);
+    return this.sourceCache.getOrLoad(gameUrl, fallbackGameUrl);
   }
 }

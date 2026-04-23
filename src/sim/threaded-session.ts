@@ -186,6 +186,7 @@ export class ThreadedSimSession {
       workerData: {
         roomKey: opts.roomKey,
         gameUrl: opts.gameUrl,
+        fallbackGameUrl: opts.fallbackGameUrl,
         relayWsUrl: opts.relayWsUrl,
         tickRate: opts.tickRate,
         startAction: opts.startAction,

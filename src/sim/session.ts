@@ -16,6 +16,7 @@ import type { SandboxWarmPool } from "./warm-pool.js";
 export interface SimSessionOptions {
   roomKey: string;
   gameUrl: string;
+  fallbackGameUrl?: string;
   relayWsUrl?: string;
   tickRate?: number;
   startAction?: string;
@@ -230,6 +231,7 @@ export class SimSession {
   readonly id: string;
   readonly roomKey: string;
   readonly gameUrl: string;
+  readonly fallbackGameUrl?: string;
   readonly userId: string;
 
   private relayClient: RelayClient;
@@ -271,6 +273,7 @@ export class SimSession {
     this.id = randomUUID();
     this.roomKey = opts.roomKey;
     this.gameUrl = opts.gameUrl;
+    this.fallbackGameUrl = opts.fallbackGameUrl;
     this.userId = `sim-bot-${this.id.slice(0, 8)}`;
     this.logger = opts.logger;
     this.warmPool = opts.warmPool || null;
@@ -331,6 +334,7 @@ export class SimSession {
       this.runtime = await loadSimRuntime(this.gameUrl, this.logger, {
         seed,
         preparedSource,
+        fallbackGameUrl: this.fallbackGameUrl,
       });
       if (this.isStopped()) {
         throw new Error(`sim session stopped during reserve room=${this.roomKey}`);

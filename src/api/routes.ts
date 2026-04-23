@@ -8,6 +8,7 @@ const JoinSimBodySchema = z.object({
   room_key: z.string().min(1),
   relay_ws_url: z.string().url().optional(),
   game_url: z.string().url(),
+  fallback_game_url: z.string().url().optional(),
   tick_rate: z.number().int().positive().optional(),
   start_action: z.string().min(1).max(64).optional(),
   mode: z.enum(["reserve", "active"]).optional(),
@@ -59,6 +60,7 @@ export function registerRoutes(
       room_key,
       relay_ws_url,
       game_url,
+      fallback_game_url,
       tick_rate,
       start_action,
       mode,
@@ -68,6 +70,7 @@ export function registerRoutes(
       const session = await simManager.join(room_key, {
         relayWsUrl: relay_ws_url,
         gameUrl: game_url,
+        fallbackGameUrl: fallback_game_url,
         tickRate: tick_rate,
         startAction: start_action,
         mode: mode || "active",
@@ -82,6 +85,19 @@ export function registerRoutes(
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      req.log.error(
+        {
+          err,
+          room_key,
+          relay_ws_url,
+          game_url,
+          fallback_game_url,
+          tick_rate,
+          start_action,
+          mode: mode || "active",
+        },
+        "sim join failed"
+      );
       return reply.status(500).send({ error: msg });
     }
   });

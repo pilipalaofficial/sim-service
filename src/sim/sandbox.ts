@@ -17,6 +17,7 @@ export interface LoadedSimRuntime {
 
 export interface PreparedGameSource {
   gameUrl: string;
+  sourceUrl?: string;
   htmlSize: number;
   scripts: string[];
   preparedAt: number;
@@ -69,7 +70,11 @@ function extractInlineScripts(html: string): string[] {
   return blocks;
 }
 
-function prepareGameSource(gameUrl: string, html: string): PreparedGameSource {
+function prepareGameSource(
+  gameUrl: string,
+  html: string,
+  sourceUrl = gameUrl
+): PreparedGameSource {
   if (!/__DELTA_GAME_CONFIG__/.test(html)) {
     throw new Error("game html does not define __DELTA_GAME_CONFIG__");
   }
@@ -79,10 +84,41 @@ function prepareGameSource(gameUrl: string, html: string): PreparedGameSource {
   }
   return {
     gameUrl,
+    sourceUrl,
     htmlSize: html.length,
     scripts,
     preparedAt: Date.now(),
   };
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as { cause?: unknown }).cause;
+    const causeMessage =
+      cause instanceof Error
+        ? cause.message
+        : cause !== undefined && cause !== null
+          ? String(cause)
+          : "";
+    return causeMessage ? `${err.message} (${causeMessage})` : err.message;
+  }
+  return String(err ?? "unknown error");
+}
+
+function shouldRetryWithFallback(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const message = String(err.message || "");
+  if (err.name === "AbortError") return true;
+  const statusMatch = message.match(/^fetch game html failed: status=(\d+)/i);
+  if (statusMatch) {
+    const status = Number(statusMatch[1]);
+    return Number.isFinite(status) && status >= 500;
+  }
+  if (/^fetch failed:?/i.test(message)) return true;
+  const haystack = `${message} ${String((err as any).stack || "")} ${String((err as any).cause || "")}`;
+  return /(ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|UND_ERR_|network|timed out|aborted)/i.test(
+    haystack
+  );
 }
 
 async function fetchGameHtml(gameUrl: string): Promise<string> {
@@ -116,10 +152,28 @@ async function fetchGameHtml(gameUrl: string): Promise<string> {
 }
 
 export async function fetchPreparedGameSource(
-  gameUrl: string
+  gameUrl: string,
+  fallbackGameUrl?: string
 ): Promise<PreparedGameSource> {
-  const html = await fetchGameHtml(gameUrl);
-  return prepareGameSource(gameUrl, html);
+  try {
+    const html = await fetchGameHtml(gameUrl);
+    return prepareGameSource(gameUrl, html, gameUrl);
+  } catch (primaryErr) {
+    const fallback = String(fallbackGameUrl || "").trim();
+    if (!fallback || fallback === gameUrl || !shouldRetryWithFallback(primaryErr)) {
+      throw primaryErr;
+    }
+    try {
+      const fallbackHtml = await fetchGameHtml(fallback);
+      return prepareGameSource(gameUrl, fallbackHtml, fallback);
+    } catch (fallbackErr) {
+      const combined = new Error(
+        `primary fetch failed (${describeError(primaryErr)}); fallback fetch failed (${describeError(fallbackErr)})`
+      );
+      (combined as any).cause = fallbackErr;
+      throw combined;
+    }
+  }
 }
 
 export function clonePreparedGameSource(
@@ -127,6 +181,7 @@ export function clonePreparedGameSource(
 ): PreparedGameSource {
   return {
     gameUrl: String(source.gameUrl || ""),
+    sourceUrl: source.sourceUrl ? String(source.sourceUrl) : undefined,
     htmlSize: Number(source.htmlSize || 0),
     scripts: Array.isArray(source.scripts)
       ? source.scripts.map((s) => String(s || ""))
@@ -248,6 +303,7 @@ export async function loadSimRuntime(
   opts?: {
     seed?: SimSandboxSeed | null;
     preparedSource?: PreparedGameSource | null;
+    fallbackGameUrl?: string;
   }
 ): Promise<LoadedSimRuntime> {
   const inlinePreparedSource = getPreparedSourceForGame(
@@ -255,7 +311,8 @@ export async function loadSimRuntime(
     opts?.preparedSource
   );
   const preparedSource =
-    inlinePreparedSource || (await fetchPreparedGameSource(gameUrl));
+    inlinePreparedSource ||
+    (await fetchPreparedGameSource(gameUrl, opts?.fallbackGameUrl));
   const scripts = preparedSource.scripts;
 
   const seed = opts?.seed || createSandboxSeed(logger);
@@ -285,8 +342,9 @@ export async function loadSimRuntime(
     throw new Error("game config missing onAction()");
   }
 
+  const loadedFrom = preparedSource.sourceUrl || gameUrl;
   logger.info(
-    `[sim-sandbox] loaded game config from ${gameUrl} (scripts=${scripts.length}, executed=${executed}, source=${inlinePreparedSource ? "preloaded" : "fetched"})`
+    `[sim-sandbox] loaded game config from ${gameUrl} via ${loadedFrom} (scripts=${scripts.length}, executed=${executed}, source=${inlinePreparedSource ? "preloaded" : loadedFrom === gameUrl ? "fetched_primary" : "fetched_fallback"})`
   );
 
   return {
