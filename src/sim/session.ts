@@ -77,6 +77,17 @@ interface QueuedAction {
 }
 
 const BOT_PREFIXES = ["ai-agent-", "stream-bot-", "sim-bot-"];
+const COALESCIBLE_CONTINUOUS_ACTIONS = new Set([
+  "MOVE",
+  "THRUST",
+  "TURN",
+  "STEER",
+  "AIM",
+  "LOOK",
+  "INPUT",
+  "WALK",
+  "RUN",
+]);
 
 function isBotUser(userId: string): boolean {
   return BOT_PREFIXES.some((p) => userId.startsWith(p));
@@ -139,6 +150,14 @@ function clampSnapshotRate(v: number, tickRate: number): number {
 // them.
 const PREDICT_RECONCILE_SNAPSHOT_FLOOR_HZ = 15;
 const PREDICT_RECONCILE_HIGH_TICK_THRESHOLD_HZ = 20;
+const HEAVY_CONTINUOUS_MULTIPLAYER_SNAPSHOT_SOFT_LIMIT_BYTES = 16 * 1024;
+const HEAVY_CONTINUOUS_MULTIPLAYER_SNAPSHOT_HARD_LIMIT_BYTES = 24 * 1024;
+const HEAVY_CONTINUOUS_MULTIPLAYER_SOFT_CAP_HZ = 12;
+const HEAVY_CONTINUOUS_MULTIPLAYER_HARD_CAP_HZ = 10;
+const HEAVY_CONTINUOUS_LOW_RTT_SOFT_CAP_HZ = 18;
+const HEAVY_CONTINUOUS_LOW_RTT_HARD_CAP_HZ = 16;
+const HEAVY_CONTINUOUS_MID_RTT_SOFT_CAP_HZ = 14;
+const HEAVY_CONTINUOUS_MID_RTT_HARD_CAP_HZ = 12;
 
 function applyPredictReconcileSnapshotFloor(
   requested: number,
@@ -262,6 +281,9 @@ export class SimSession {
   private pendingSync = false;
   private lastStateSyncAt = 0;
   private lastSyncedPhase: "lobby" | "playing" | "result" | "" = "";
+  private roomAvgClientRTTMs = 0;
+  private roomMaxClientRTTMs = 0;
+  private roomRTTSamples = 0;
   private simCtx: Record<string, any>;
   private relayHandlersBound = false;
   private _onDeadCallbacks: Array<(session: SimSession) => void> = [];
@@ -779,7 +801,9 @@ export class SimSession {
         if (!sourceUserId) return;
         this.enqueueAction(action, sourceUserId, inputId);
         this.drainActionQueue();
-        this.pushStateSyncIfChanged("player_action");
+        if (!this.isCoalescibleRealtimeAction(action)) {
+          this.pushStateSyncIfChanged("player_action");
+        }
         return;
       }
       case "player_joined":
@@ -814,6 +838,17 @@ export class SimSession {
         this.pushStateSyncIfChanged(msg.type);
         return;
       }
+      case "room_snapshot": {
+        const payload = (raw.payload || {}) as Record<string, any>;
+        const roomRtt = (payload.rtt || {}) as Record<string, any>;
+        const avgMs = Number(roomRtt.avg_ms || 0);
+        const maxMs = Number(roomRtt.max_ms || 0);
+        const samples = Number(roomRtt.samples || 0);
+        this.roomAvgClientRTTMs = Number.isFinite(avgMs) && avgMs > 0 ? avgMs : 0;
+        this.roomMaxClientRTTMs = Number.isFinite(maxMs) && maxMs > 0 ? maxMs : 0;
+        this.roomRTTSamples = Number.isFinite(samples) && samples > 0 ? Math.floor(samples) : 0;
+        return;
+      }
       default:
         return;
     }
@@ -828,8 +863,30 @@ export class SimSession {
       action && typeof action === "object"
         ? ({ ...action } as Record<string, any>)
         : { type: String(action || "") };
+    if (this.isCoalescibleRealtimeAction(packed)) {
+      const kind = String(packed.type || "");
+      for (let i = this.actionQueue.length - 1; i >= 0; i -= 1) {
+        const pending = this.actionQueue[i];
+        if (!pending) continue;
+        if (pending.userId !== userId) continue;
+        if (String(pending.action?.type || "") !== kind) continue;
+        this.actionQueue[i] = { action: packed, userId, inputId };
+        this._lastEventAt = Date.now();
+        return;
+      }
+    }
     this.actionQueue.push({ action: packed, userId, inputId });
     this._lastEventAt = Date.now();
+  }
+
+  private isCoalescibleRealtimeAction(action: Record<string, any> | null | undefined): boolean {
+    if (!action || typeof action !== "object") return false;
+    if (this.phase !== "playing") return false;
+    const profile = this.gameConfig?.networkProfile;
+    if (!profile || profile.usesContinuousTick !== true) return false;
+    const kind = String(action.type || "").toUpperCase();
+    if (!kind || !COALESCIBLE_CONTINUOUS_ACTIONS.has(kind)) return false;
+    return true;
   }
 
   private ackProcessedInput(userId: string, inputId: number | null): void {
@@ -1055,8 +1112,51 @@ export class SimSession {
     return snapshot;
   }
 
-  private getSnapshotIntervalMs(): number {
-    return Math.max(16, Math.floor(1000 / Math.max(1, this.snapshotRateHz)));
+  private getHumanParticipantCount(): number {
+    return Object.entries(this.players).filter(([userId, info]) =>
+      this.shouldIncludeInGameState(userId, info)
+    ).length;
+  }
+
+  private shouldApplyHeavySnapshotCap(snapshotBytes: number): boolean {
+    if (this.mode !== "active" || this.phase !== "playing") return false;
+    const profile = this.gameConfig?.networkProfile;
+    const usesContinuousTick =
+      !!(this.gameConfig && typeof this.gameConfig.onTick === "function") ||
+      profile?.usesContinuousTick === true;
+    if (profile?.class !== "predict_reconcile" || !usesContinuousTick) return false;
+    return (
+      this.getHumanParticipantCount() >= 2 &&
+      snapshotBytes >= HEAVY_CONTINUOUS_MULTIPLAYER_SNAPSHOT_SOFT_LIMIT_BYTES
+    );
+  }
+
+  private getHeavySnapshotCapHz(snapshotBytes: number): number | null {
+    if (!this.shouldApplyHeavySnapshotCap(snapshotBytes)) return null;
+    const hasRoomRTT = this.roomRTTSamples > 0 && this.roomAvgClientRTTMs > 0;
+    const lowRTT =
+      hasRoomRTT &&
+      this.roomAvgClientRTTMs <= 90 &&
+      (this.roomMaxClientRTTMs <= 0 || this.roomMaxClientRTTMs <= 130);
+    const midRTT =
+      hasRoomRTT &&
+      this.roomAvgClientRTTMs <= 160 &&
+      (this.roomMaxClientRTTMs <= 0 || this.roomMaxClientRTTMs <= 240);
+    if (snapshotBytes >= HEAVY_CONTINUOUS_MULTIPLAYER_SNAPSHOT_HARD_LIMIT_BYTES) {
+      if (lowRTT) return HEAVY_CONTINUOUS_LOW_RTT_HARD_CAP_HZ;
+      if (midRTT) return HEAVY_CONTINUOUS_MID_RTT_HARD_CAP_HZ;
+      return HEAVY_CONTINUOUS_MULTIPLAYER_HARD_CAP_HZ;
+    }
+    if (lowRTT) return HEAVY_CONTINUOUS_LOW_RTT_SOFT_CAP_HZ;
+    if (midRTT) return HEAVY_CONTINUOUS_MID_RTT_SOFT_CAP_HZ;
+    return HEAVY_CONTINUOUS_MULTIPLAYER_SOFT_CAP_HZ;
+  }
+
+  private getSnapshotIntervalMs(snapshotBytes = this.lastStateBytes): number {
+    const baseIntervalMs = Math.max(16, Math.floor(1000 / Math.max(1, this.snapshotRateHz)));
+    const heavyCapHz = this.getHeavySnapshotCapHz(snapshotBytes);
+    if (!heavyCapHz) return baseIntervalMs;
+    return Math.max(baseIntervalMs, Math.floor(1000 / heavyCapHz));
   }
 
   private shouldForceStateSync(
@@ -1083,13 +1183,6 @@ export class SimSession {
     const snapshot = this.buildStateSnapshot();
     const snapshotPhase = mapToSdkPhase(String(snapshot._phase || this.phase)) || this.phase;
     const forceSend = this.shouldForceStateSync(reason, snapshotPhase);
-    if (!forceSend && this.mode === "active" && this.lastStateSyncAt > 0) {
-      const elapsedMs = Date.now() - this.lastStateSyncAt;
-      if (elapsedMs < this.getSnapshotIntervalMs()) {
-        this.pendingSync = true;
-        return;
-      }
-    }
     let snapshotJson = "";
     try {
       snapshotJson = JSON.stringify(snapshot);
@@ -1097,10 +1190,18 @@ export class SimSession {
       snapshotJson = "";
     }
     if (!snapshotJson) return;
+    const snapshotBytes = snapshotJson.length;
+    if (!forceSend && this.mode === "active" && this.lastStateSyncAt > 0) {
+      const elapsedMs = Date.now() - this.lastStateSyncAt;
+      if (elapsedMs < this.getSnapshotIntervalMs(snapshotBytes)) {
+        this.pendingSync = true;
+        return;
+      }
+    }
     const fingerprint = fingerprintJson(snapshotJson);
     if (fingerprint === this.lastStateFingerprint && !this.pendingSync) return;
     this.lastStateFingerprint = fingerprint;
-    this.lastStateBytes = snapshotJson.length;
+    this.lastStateBytes = snapshotBytes;
     const payload = `{"type":"state_sync","payload":{"state":${snapshotJson}}}`;
     const sent = this.mode === "active" && this.relayClient.sendRaw(payload);
     if (!sent) {
