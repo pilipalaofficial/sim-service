@@ -8,6 +8,20 @@ Server-authoritative game simulation sidecar for Sharky: loads game HTML in a sa
 - A relay instance reachable at `RELAY_WS_URL` (must match the region games use)
 - Shared secret `SIM_SERVICE_SECRET` — must match gateway `RELAY_SIM_SERVICE_SECRET` / relay config
 
+## Runtime AI
+
+Generated server-authoritative games can call `ctx.requestFlavor()` / `ctx.getFlavor()` for NPC dialogue, narration, and other lightweight runtime text. To use real AI instead of deterministic fallbacks, point sim-service at the go-backend internal broker:
+
+```bash
+SIM_AI_ENABLED=1
+SIM_AI_FLAVOR_URL=https://your-api.example.com/internal/runtime-ai/flavor
+SIM_AI_SECRET=the-same-secret-configured-as-RUNTIME_AI_INTERNAL_SECRET
+SIM_AI_TIMEOUT_MS=12000
+SIM_AI_MAX_TOKENS=180
+```
+
+If this is not configured, sim-service stays safe and returns each request's `fallbackText`.
+
 ## Configuration（systemd）
 
 生产部署现在使用：

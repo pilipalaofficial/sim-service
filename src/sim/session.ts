@@ -18,6 +18,7 @@ export interface SimSessionOptions {
   roomKey: string;
   gameUrl: string;
   fallbackGameUrl?: string;
+  runtimeAiFlavorUrl?: string;
   relayWsUrl?: string;
   tickRate?: number;
   startAction?: string;
@@ -78,10 +79,11 @@ interface QueuedAction {
 }
 
 interface SimFlavorSlot {
-  status: "ready" | "failed";
+  status: "pending" | "ready" | "failed" | "expired";
   text?: string | null;
   url?: string | null;
-  source: "fallback";
+  source: "ai" | "fallback";
+  error?: string;
 }
 
 const BOT_PREFIXES = ["ai-agent-", "stream-bot-", "sim-bot-"];
@@ -259,6 +261,7 @@ export class SimSession {
   readonly roomKey: string;
   readonly gameUrl: string;
   readonly fallbackGameUrl?: string;
+  readonly runtimeAiFlavorUrl?: string;
   readonly userId: string;
 
   private relayClient: RelayClient;
@@ -305,6 +308,7 @@ export class SimSession {
     this.roomKey = opts.roomKey;
     this.gameUrl = opts.gameUrl;
     this.fallbackGameUrl = opts.fallbackGameUrl;
+    this.runtimeAiFlavorUrl = opts.runtimeAiFlavorUrl;
     this.userId = `sim-bot-${this.id.slice(0, 8)}`;
     this.logger = opts.logger;
     this.warmPool = opts.warmPool || null;
@@ -329,6 +333,143 @@ export class SimSession {
 
     this.simCtx = this.buildSimContext();
     this.assertRuntimeContractCoverage();
+  }
+
+  private setFallbackFlavor(
+    key: string,
+    fallbackText: string | null,
+    status: "failed" | "expired" = "failed",
+    error?: string
+  ): void {
+    const hasFallback = typeof fallbackText === "string" && fallbackText.trim().length > 0;
+    this.flavorSlots.set(key, {
+      status: hasFallback ? "ready" : status,
+      text: fallbackText,
+      source: "fallback",
+      error,
+    });
+  }
+
+  private requestRuntimeFlavor(key: string, opts: Record<string, any>): void {
+    const flavorType = String(opts.type || "text");
+    if (flavorType !== "text") {
+      const fallbackUrl =
+        opts.fallbackUrl == null ? null : String(opts.fallbackUrl);
+      this.flavorSlots.set(key, {
+        status: fallbackUrl == null ? "failed" : "ready",
+        url: fallbackUrl,
+        source: "fallback",
+        error: "unsupported flavor type",
+      });
+      return;
+    }
+
+    const fallbackText =
+      opts.fallbackText == null ? null : String(opts.fallbackText);
+    const prompt = String(opts.prompt || "").trim();
+    const flavorUrl = this.runtimeAiFlavorUrl || config.ai.flavorUrl;
+    if (!config.ai.enabled || !flavorUrl || !prompt) {
+      this.setFallbackFlavor(
+        key,
+        fallbackText,
+        "failed",
+        prompt ? "runtime ai disabled" : "empty prompt"
+      );
+      return;
+    }
+
+    this.flavorSlots.set(key, {
+      status: "pending",
+      text: fallbackText,
+      source: "fallback",
+    });
+
+    void this.resolveRuntimeFlavor(key, opts, fallbackText);
+  }
+
+  private async resolveRuntimeFlavor(
+    key: string,
+    opts: Record<string, any>,
+    fallbackText: string | null
+  ): Promise<void> {
+    const timeoutMs = Math.max(
+      1000,
+      Math.min(
+        Number(opts.timeoutMs || config.ai.timeoutMs || 12000),
+        config.ai.timeoutMs || 12000
+      )
+    );
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const flavorUrl = this.runtimeAiFlavorUrl || config.ai.flavorUrl;
+      if (!flavorUrl) {
+        this.setFallbackFlavor(key, fallbackText, "failed", "runtime ai url missing");
+        return;
+      }
+
+      const resp = await fetch(flavorUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Internal-Secret": config.ai.secret,
+        },
+        body: JSON.stringify({
+          room_key: this.roomKey,
+          game_id: this.gameUrl,
+          request_id: key,
+          type: String(opts.type || "text"),
+          prompt: String(opts.prompt || ""),
+          fallback_text: fallbackText || "",
+          max_tokens: Number(opts.maxTokens || config.ai.maxTokens || 180),
+          timeout_ms: timeoutMs,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (!resp.ok) {
+        this.setFallbackFlavor(key, fallbackText, "expired", `ai http ${resp.status}`);
+        return;
+      }
+
+      const body = (await resp.json()) as any;
+      if (body?.error_code && Number(body.error_code) !== 0) {
+        this.setFallbackFlavor(
+          key,
+          fallbackText,
+          "failed",
+          body?.error_message ? String(body.error_message) : "ai broker error"
+        );
+        return;
+      }
+      const data = body?.data || body;
+      const status = String(data?.status || "");
+      const text = data?.text == null ? "" : String(data.text);
+      const source = data?.source === "ai" ? "ai" : "fallback";
+
+      if (status === "ready" && text.trim()) {
+        this.flavorSlots.set(key, {
+          status: "ready",
+          text,
+          source,
+        });
+        return;
+      }
+
+      this.setFallbackFlavor(
+        key,
+        text.trim() ? text : fallbackText,
+        status === "expired" ? "expired" : "failed",
+        data?.error ? String(data.error) : "ai returned no ready text"
+      );
+    } catch (err) {
+      clearTimeout(timer);
+      const message = err instanceof Error ? err.message : String(err);
+      this.setFallbackFlavor(key, fallbackText, "expired", message);
+      this.logger.warn(`[sim] runtime ai flavor failed room=${this.roomKey} id=${key}`, err);
+    }
   }
 
   onDead(cb: (session: SimSession) => void): void {
@@ -649,29 +790,11 @@ export class SimSession {
         if (!key) return;
 
         const existing = self.flavorSlots.get(key);
-        if (existing && existing.status === "ready") {
+        if (existing) {
           return;
         }
 
-        const flavorType = String(opts.type || "text");
-        if (flavorType === "text") {
-          const fallbackText =
-            opts.fallbackText == null ? null : String(opts.fallbackText);
-          self.flavorSlots.set(key, {
-            status: fallbackText == null ? "failed" : "ready",
-            text: fallbackText,
-            source: "fallback",
-          });
-          return;
-        }
-
-        const fallbackUrl =
-          opts.fallbackUrl == null ? null : String(opts.fallbackUrl);
-        self.flavorSlots.set(key, {
-          status: fallbackUrl == null ? "failed" : "ready",
-          url: fallbackUrl,
-          source: "fallback",
-        });
+        self.requestRuntimeFlavor(key, opts);
       },
       getFlavor: (id: string) => self.flavorSlots.get(String(id || "")) || null,
       requestJudge: () => {},

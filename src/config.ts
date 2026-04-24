@@ -54,4 +54,12 @@ export const config = {
     runtimeStepHardMs: parseInt(env("SIM_RUNTIME_STEP_HARD_MS", "120")),
     runtimeMaxOverruns: parseInt(env("SIM_RUNTIME_MAX_OVERRUNS", "2")),
   },
+
+  ai: {
+    enabled: env("SIM_AI_ENABLED", "0").trim() === "1",
+    flavorUrl: env("SIM_AI_FLAVOR_URL", ""),
+    secret: env("SIM_AI_SECRET", env("SIM_SERVICE_SECRET", "")),
+    timeoutMs: parseInt(env("SIM_AI_TIMEOUT_MS", "12000")),
+    maxTokens: parseInt(env("SIM_AI_MAX_TOKENS", "180")),
+  },
 } as const;
