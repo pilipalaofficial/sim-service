@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { CTX_RUNTIME_CONTRACT } from "@delta/runtime-contract";
 import {
   RelayClient,
   type NetworkBootstrap,
@@ -74,6 +75,13 @@ interface QueuedAction {
   action: Record<string, any>;
   userId: string;
   inputId: number | null;
+}
+
+interface SimFlavorSlot {
+  status: "ready" | "failed";
+  text?: string | null;
+  url?: string | null;
+  source: "fallback";
 }
 
 const BOT_PREFIXES = ["ai-agent-", "stream-bot-", "sim-bot-"];
@@ -288,6 +296,7 @@ export class SimSession {
   private relayHandlersBound = false;
   private _onDeadCallbacks: Array<(session: SimSession) => void> = [];
   private _runtimeConsecutiveOverruns = 0;
+  private flavorSlots = new Map<string, SimFlavorSlot>();
 
   static readonly MAX_RELAY_DISCONNECTS = 6;
 
@@ -319,6 +328,7 @@ export class SimSession {
     });
 
     this.simCtx = this.buildSimContext();
+    this.assertRuntimeContractCoverage();
   }
 
   onDead(cb: (session: SimSession) => void): void {
@@ -619,6 +629,9 @@ export class SimSession {
       showToast: () => {},
       showModal: () => {},
       showTextInput: () => {},
+      setHud: () => {},
+      setUiTree: () => {},
+      setTextInput: () => {},
       playSound: () => {},
       setBgm: () => {},
       stopSound: () => {},
@@ -631,6 +644,40 @@ export class SimSession {
         status: "error",
         error: "askAI is unavailable in sim runtime",
       }),
+      requestFlavor: (id: string, opts: Record<string, any> = {}) => {
+        const key = String(id || "");
+        if (!key) return;
+
+        const existing = self.flavorSlots.get(key);
+        if (existing && existing.status === "ready") {
+          return;
+        }
+
+        const flavorType = String(opts.type || "text");
+        if (flavorType === "text") {
+          const fallbackText =
+            opts.fallbackText == null ? null : String(opts.fallbackText);
+          self.flavorSlots.set(key, {
+            status: fallbackText == null ? "failed" : "ready",
+            text: fallbackText,
+            source: "fallback",
+          });
+          return;
+        }
+
+        const fallbackUrl =
+          opts.fallbackUrl == null ? null : String(opts.fallbackUrl);
+        self.flavorSlots.set(key, {
+          status: fallbackUrl == null ? "failed" : "ready",
+          url: fallbackUrl,
+          source: "fallback",
+        });
+      },
+      getFlavor: (id: string) => self.flavorSlots.get(String(id || "")) || null,
+      requestJudge: () => {},
+      getJudge: () => null,
+      requestDirector: () => {},
+      getDirectorProposal: () => null,
       // Mirror game-sdk.js's ctx.getGameData (game-sdk.js:4042-4046).
       //
       // Trivia Roulette 286a7348 incident (2026-04-23): without this,
@@ -683,6 +730,21 @@ export class SimSession {
     };
   }
 
+  private assertRuntimeContractCoverage(): void {
+    const missing: string[] = [];
+    for (const [apiName, contract] of Object.entries(CTX_RUNTIME_CONTRACT)) {
+      if (contract.serverSim === "unsupported") continue;
+      if (typeof this.simCtx[apiName] !== "function") {
+        missing.push(apiName);
+      }
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `simCtx is missing server_sim runtime contract API(s): ${missing.join(", ")}`
+      );
+    }
+  }
+
   private setPhase(next: string): void {
     const mapped = mapToSdkPhase(String(next));
     if (mapped === null) return;
@@ -694,6 +756,7 @@ export class SimSession {
   }
 
   private callInitState(): void {
+    this.flavorSlots.clear();
     if (!this.gameConfig) {
       this.state = { players: {}, _phase: this.phase };
       return;
