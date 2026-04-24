@@ -8,20 +8,16 @@ Server-authoritative game simulation sidecar for Sharky: loads game HTML in a sa
 - A relay instance reachable at `RELAY_WS_URL` (must match the region games use)
 - Shared secret `SIM_SERVICE_SECRET` — must match gateway `RELAY_SIM_SERVICE_SECRET` / relay config
 
-## Configuration（PM2）
+## Configuration（systemd）
 
-复制示例并改名（已在 `.gitignore` 中，勿提交仓库）：
+生产部署现在使用：
 
-```bash
-cp ecosystem.config.example.cjs ecosystem.config.cjs
-# 或与 deploy 一致：cp ecosystem.config.example.cjs ecosystem.config.sg-lab.cjs
-```
+- `deploy/envs/<env>.env`
+- `deploy/systemd/sim-service.service.tpl`
 
-在 `env` 里填写 `SIM_SERVICE_SECRET`（须与网关 `RELAY_SIM_SERVICE_SECRET` 一致）、`RELAY_WS_URL` 等。
+部署脚本会把对应环境的 `.env` 上传到远端 `/data/sim-service/.env`，再把 systemd unit 安装到 `/etc/systemd/system/sim-service.service`。
 
-```bash
-pm2 start ecosystem.config.cjs
-```
+当前保留 `ecosystem.config.*.cjs` 仅作历史参考/兼容，不再作为生产托管入口。
 
 ## Deploy script
 

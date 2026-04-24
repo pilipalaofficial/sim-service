@@ -4,8 +4,9 @@ set -euo pipefail
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 REMOTE_DIR="/data/sim-service"
 APP_NAME="sim-service"
-# Must match PORT in ecosystem.config.<env>.cjs (sg-lab uses 3500)
 APP_PORT="${SIM_SERVICE_HEALTH_PORT:-3500}"
+SYSTEMD_UNIT_NAME="sim-service.service"
+SYSTEMD_UNIT_TEMPLATE="${LOCAL_DIR}/deploy/systemd/sim-service.service.tpl"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
@@ -78,11 +79,13 @@ case "${DEPLOY_ENV}" in
     ;;
 esac
 
-ECOSYSTEM_LOCAL="${LOCAL_DIR}/ecosystem.config.${DEPLOY_ENV}.cjs"
-[[ "${MODE}" != "status" && "${MODE}" != "setup" && ! -f "${ECOSYSTEM_LOCAL}" ]] && \
-  err "Ecosystem config not found: ${ECOSYSTEM_LOCAL}"
-
 [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
+
+ENV_LOCAL="${LOCAL_DIR}/deploy/envs/${DEPLOY_ENV}.env"
+[[ "${MODE}" != "status" && "${MODE}" != "setup" && ! -f "${ENV_LOCAL}" ]] && \
+  err "Env file not found: ${ENV_LOCAL}"
+[[ "${MODE}" != "status" && "${MODE}" != "setup" && ! -f "${SYSTEMD_UNIT_TEMPLATE}" ]] && \
+  err "Systemd unit template not found: ${SYSTEMD_UNIT_TEMPLATE}"
 
 SSH_CMD="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${REMOTE_USER}@${REMOTE_HOST}"
 RSYNC_SSH="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=30"
@@ -92,11 +95,19 @@ SUDO=""
 info "Environment: ${DEPLOY_ENV}"
 info "Server:      ${REMOTE_USER}@${REMOTE_HOST}"
 info "Remote dir:  ${REMOTE_DIR}"
-[[ "${MODE}" != "status" && "${MODE}" != "setup" ]] && info "Ecosystem:   ${ECOSYSTEM_LOCAL}"
+[[ "${MODE}" != "status" && "${MODE}" != "setup" ]] && info "Env file:    ${ENV_LOCAL}"
 echo
 
 ensure_remote_dir() {
   ${SSH_CMD} "${SUDO} mkdir -p ${REMOTE_DIR} && ${SUDO} chown -R ${REMOTE_USER}:${REMOTE_USER} ${REMOTE_DIR}"
+}
+
+render_systemd_unit() {
+  local target="$1"
+  sed \
+    -e "s|__RUN_USER__|${REMOTE_USER}|g" \
+    -e "s|__WORKDIR__|${REMOTE_DIR}|g" \
+    "${SYSTEMD_UNIT_TEMPLATE}" > "${target}"
 }
 
 do_setup() {
@@ -108,7 +119,6 @@ if command -v node &>/dev/null; then echo "Node: $(node -v)"
 else curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs
 fi
 INSTALL_NODE
-  ${SSH_CMD} "command -v pm2 &>/dev/null || ${SUDO} npm install -g pm2"
   ${SSH_CMD} "${SUDO} ufw allow ${APP_PORT}/tcp 2>/dev/null || true"
   ok "Setup done — now run: ./deploy.sh --env ${DEPLOY_ENV}"
 }
@@ -124,6 +134,7 @@ do_sync_code() {
   build_dist
   ensure_remote_dir
   rsync -avz --delete \
+    --filter='protect .env' \
     --include='ecosystem.config.example.cjs' \
     --exclude='ecosystem.config.cjs' \
     --exclude='ecosystem.config.*.cjs' \
@@ -133,10 +144,21 @@ do_sync_code() {
   ok "Code synced"
 }
 
-do_sync_ecosystem() {
+do_sync_env() {
   scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no \
-    "${ECOSYSTEM_LOCAL}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/ecosystem.config.cjs"
-  ok "Ecosystem synced (${ECOSYSTEM_LOCAL} → ecosystem.config.cjs)"
+    "${ENV_LOCAL}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/.env"
+  ok "Environment synced (${ENV_LOCAL} → .env)"
+}
+
+do_sync_systemd_unit() {
+  local rendered
+  rendered="$(mktemp)"
+  render_systemd_unit "${rendered}"
+  scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no \
+    "${rendered}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/${SYSTEMD_UNIT_NAME}"
+  rm -f "${rendered}"
+  ${SSH_CMD} "${SUDO} mv ${REMOTE_DIR}/${SYSTEMD_UNIT_NAME} /etc/systemd/system/${SYSTEMD_UNIT_NAME} && ${SUDO} systemctl daemon-reload"
+  ok "Systemd unit synced (/etc/systemd/system/${SYSTEMD_UNIT_NAME})"
 }
 
 do_install() {
@@ -147,14 +169,14 @@ do_install() {
 
 do_restart() {
   info "Restarting ${APP_NAME}..."
-  ${SSH_CMD} "cd ${REMOTE_DIR} && pm2 startOrRestart ecosystem.config.cjs --update-env && pm2 save"
+  ${SSH_CMD} "${SUDO} systemctl enable --now ${SYSTEMD_UNIT_NAME} && ${SUDO} systemctl restart ${SYSTEMD_UNIT_NAME}"
   sleep 2
-  ${SSH_CMD} "curl -sf http://127.0.0.1:${APP_PORT}/health" && ok "Health check passed" || warn "Health check failed — run: pm2 logs ${APP_NAME}"
+  ${SSH_CMD} "curl -sf http://127.0.0.1:${APP_PORT}/health" && ok "Health check passed" || warn "Health check failed — run: ${SUDO} journalctl -u ${SYSTEMD_UNIT_NAME} -n 100 --no-pager"
 }
 
 do_status() {
-  info "=== PM2 Status ==="
-  ${SSH_CMD} "pm2 status" || true
+  info "=== systemd Status ==="
+  ${SSH_CMD} "${SUDO} systemctl status ${SYSTEMD_UNIT_NAME} --no-pager -l" || true
   echo
   info "=== Health Check ==="
   ${SSH_CMD} "curl -sf http://127.0.0.1:${APP_PORT}/health && echo" || warn "Health check failed"
@@ -165,13 +187,15 @@ case "${MODE}" in
   status)  do_status ;;
   restart)
     ensure_remote_dir
-    do_sync_ecosystem
+    do_sync_env
+    do_sync_systemd_unit
     do_restart
     ;;
   sync)    do_sync_code ;;
   full)
     do_sync_code
-    do_sync_ecosystem
+    do_sync_env
+    do_sync_systemd_unit
     do_install
     do_restart
     ;;
