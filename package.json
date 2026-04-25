@@ -7,11 +7,13 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "prebuild": "node scripts/check-runtime-contract-locks.mjs",
     "build": "tsc",
+    "check:runtime-contract": "node scripts/check-runtime-contract-locks.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@delta/runtime-contract": "https://github.com/pilipalaofficial/delta-runtime-contract/archive/263151e74c02bf5f72981ee91da86b3c37989772.tar.gz",
+    "@delta/runtime-contract": "https://github.com/pilipalaofficial/delta-runtime-contract/archive/fd9b669bf3adddf5f83d695c34256ea08a66af94.tar.gz",
     "fastify": "^5.3.3",
     "tsx": "^4.19.4",
     "ws": "^8.18.2",

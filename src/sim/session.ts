@@ -70,6 +70,7 @@ interface SimPlayerInfo {
   display_name?: string;
   online?: boolean;
   spectator?: boolean;
+  bot?: boolean;
 }
 
 interface QueuedAction {
@@ -86,7 +87,59 @@ interface SimFlavorSlot {
   error?: string;
 }
 
+interface SimJudgeSlot {
+  status: "pending" | "ready" | "failed" | "expired";
+  verdict: string;
+  confidence?: number;
+  reason?: string;
+  source: "ai" | "fallback";
+  error?: string;
+}
+
+interface SimDirectorSlot {
+  status: "pending" | "ready" | "failed" | "expired";
+  proposalType?: string;
+  payload?: Record<string, any>;
+  rationale?: string;
+  source: "ai" | "fallback";
+  error?: string;
+}
+
+interface SimContentSlot {
+  status: "pending" | "ready" | "failed" | "expired";
+  data?: any;
+  text?: string | null;
+  source: "ai" | "fallback";
+  error?: string;
+}
+
+interface BotPoint {
+  x: number;
+  y: number;
+}
+
+interface BotActionCandidate {
+  action: Record<string, any>;
+  index: number;
+  score: number;
+}
+
+type ServerSimRuntimeSupport =
+  | "implemented"
+  | "supported"
+  | "fallback"
+  | "noop"
+  | "unsupported";
+
+interface ServerSimRuntimeContractEntry {
+  serverSim?: ServerSimRuntimeSupport;
+  lane?: string;
+  capability?: string;
+}
+
 const BOT_PREFIXES = ["ai-agent-", "stream-bot-", "sim-bot-"];
+const PLATFORM_BOT_PREFIX = "ai-agent-";
+const DEFAULT_PLATFORM_BOT_NAME = "sharky";
 const COALESCIBLE_CONTINUOUS_ACTIONS = new Set([
   "MOVE",
   "THRUST",
@@ -101,6 +154,11 @@ const COALESCIBLE_CONTINUOUS_ACTIONS = new Set([
 
 function isBotUser(userId: string): boolean {
   return BOT_PREFIXES.some((p) => userId.startsWith(p));
+}
+
+function isPlatformBotInfo(userId: string, info: SimPlayerInfo | undefined): boolean {
+  if (!userId || !info) return false;
+  return info.bot === true || info.role === "bot";
 }
 
 // Default PHASE_MACHINE matches assembled game-sdk.js (lobby / playing / result).
@@ -300,6 +358,10 @@ export class SimSession {
   private _onDeadCallbacks: Array<(session: SimSession) => void> = [];
   private _runtimeConsecutiveOverruns = 0;
   private flavorSlots = new Map<string, SimFlavorSlot>();
+  private judgeSlots = new Map<string, SimJudgeSlot>();
+  private directorSlots = new Map<string, SimDirectorSlot>();
+  private contentSlots = new Map<string, SimContentSlot>();
+  private botBlackboards = new Map<string, Record<string, any>>();
 
   static readonly MAX_RELAY_DISCONNECTS = 6;
 
@@ -470,6 +532,262 @@ export class SimSession {
       this.setFallbackFlavor(key, fallbackText, "expired", message);
       this.logger.warn(`[sim] runtime ai flavor failed room=${this.roomKey} id=${key}`, err);
     }
+  }
+
+  private runtimeAiUrl(): string {
+    return this.runtimeAiFlavorUrl || config.ai.runtimeUrl || config.ai.flavorUrl;
+  }
+
+  private pickFallbackVerdict(allowedVerdicts: string[]): string {
+    const preferred = ["unresolved", "reject", "incorrect", "invalid", "no", "false"];
+    for (const verdict of preferred) {
+      if (allowedVerdicts.includes(verdict)) return verdict;
+    }
+    return allowedVerdicts[0] || "unresolved";
+  }
+
+  private setFallbackJudge(
+    key: string,
+    opts: Record<string, any>,
+    status: "ready" | "failed" | "expired" = "ready",
+    error?: string
+  ): void {
+    const allowed = Array.isArray(opts.allowedVerdicts)
+      ? opts.allowedVerdicts.filter((v: unknown): v is string => typeof v === "string")
+      : [];
+    this.judgeSlots.set(key, {
+      status,
+      verdict: this.pickFallbackVerdict(allowed),
+      confidence: 0,
+      reason: "Runtime AI unavailable; deterministic fallback verdict used.",
+      source: "fallback",
+      error,
+    });
+  }
+
+  private setFallbackDirector(
+    key: string,
+    status: "failed" | "expired" = "failed",
+    error?: string
+  ): void {
+    this.directorSlots.set(key, {
+      status,
+      source: "fallback",
+      rationale: "Runtime AI unavailable; no gameplay adjustment proposal.",
+      error,
+    });
+  }
+
+  private setFallbackContent(
+    key: string,
+    opts: Record<string, any>,
+    status: "ready" | "failed" | "expired" = "ready",
+    error?: string
+  ): void {
+    const hasFallback =
+      opts.fallbackData !== undefined ||
+      (typeof opts.fallbackText === "string" && opts.fallbackText.length > 0);
+    this.contentSlots.set(key, {
+      status: hasFallback ? status : "failed",
+      data: opts.fallbackData,
+      text: opts.fallbackText == null ? null : String(opts.fallbackText),
+      source: "fallback",
+      error,
+    });
+  }
+
+  private requestRuntimeJudge(key: string, opts: Record<string, any>): void {
+    const url = this.runtimeAiUrl();
+    if (!config.ai.enabled || !url) {
+      this.setFallbackJudge(key, opts, "ready", "runtime ai disabled");
+      return;
+    }
+    this.judgeSlots.set(key, {
+      status: "pending",
+      verdict: this.pickFallbackVerdict(
+        Array.isArray(opts.allowedVerdicts) ? opts.allowedVerdicts : []
+      ),
+      source: "fallback",
+    });
+    void this.resolveRuntimeLane(key, "judge", opts);
+  }
+
+  private requestRuntimeDirector(key: string, opts: Record<string, any>): void {
+    const url = this.runtimeAiUrl();
+    if (!config.ai.enabled || !url) {
+      this.setFallbackDirector(key, "failed", "runtime ai disabled");
+      return;
+    }
+    this.directorSlots.set(key, {
+      status: "pending",
+      source: "fallback",
+    });
+    void this.resolveRuntimeLane(key, "director", opts);
+  }
+
+  private requestRuntimeContent(key: string, opts: Record<string, any>): void {
+    const url = this.runtimeAiUrl();
+    if (!config.ai.enabled || !url) {
+      this.setFallbackContent(key, opts, "ready", "runtime ai disabled");
+      return;
+    }
+    this.contentSlots.set(key, {
+      status: "pending",
+      data: opts.fallbackData,
+      text: opts.fallbackText == null ? null : String(opts.fallbackText),
+      source: "fallback",
+    });
+    void this.resolveRuntimeLane(key, "content", opts);
+  }
+
+  private async resolveRuntimeLane(
+    key: string,
+    lane: "judge" | "director" | "content",
+    opts: Record<string, any>
+  ): Promise<void> {
+    const timeoutMs = Math.max(
+      1000,
+      Math.min(
+        Number(opts.timeoutMs || config.ai.timeoutMs || 12000),
+        config.ai.timeoutMs || 12000
+      )
+    );
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const url = this.runtimeAiUrl();
+      if (!url) {
+        this.applyRuntimeLaneFallback(key, lane, opts, "failed", "runtime ai url missing");
+        return;
+      }
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": config.ai.secret ? `Bearer ${config.ai.secret}` : "",
+          "X-Runtime-AI-Secret": config.ai.secret,
+          "x-runtime-ai-secret": config.ai.secret,
+          "X-Internal-Secret": config.ai.secret,
+        },
+        body: JSON.stringify({
+          id: key,
+          lane,
+          roomId: this.roomKey,
+          room_key: this.roomKey,
+          game_id: this.gameUrl,
+          phase: this.phase,
+          publicInput: opts,
+          runtimeSnapshot: {
+            phase: this.phase,
+            playerCount: Object.keys(this.players).length,
+            recentEvents: [],
+          },
+          timeoutMs,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (!resp.ok) {
+        this.applyRuntimeLaneFallback(key, lane, opts, "expired", `ai http ${resp.status}`);
+        return;
+      }
+
+      const body = (await resp.json()) as any;
+      if (body?.error_code && Number(body.error_code) !== 0) {
+        this.applyRuntimeLaneFallback(
+          key,
+          lane,
+          opts,
+          "failed",
+          body?.error_message ? String(body.error_message) : "ai broker error"
+        );
+        return;
+      }
+
+      const data = body?.data || body?.result || body;
+      const status = String(body?.status || data?.status || "");
+      if (status === "failed" || status === "error" || status === "expired") {
+        this.applyRuntimeLaneFallback(key, lane, opts, status === "expired" ? "expired" : "failed", data?.error || status);
+        return;
+      }
+
+      this.commitRuntimeLaneResult(key, lane, opts, data);
+    } catch (err) {
+      clearTimeout(timer);
+      const message = err instanceof Error ? err.message : String(err);
+      this.applyRuntimeLaneFallback(key, lane, opts, "expired", message);
+      this.logger.warn(`[sim] runtime ai ${lane} failed room=${this.roomKey} id=${key}`, err);
+    }
+  }
+
+  private applyRuntimeLaneFallback(
+    key: string,
+    lane: "judge" | "director" | "content",
+    opts: Record<string, any>,
+    status: "failed" | "expired",
+    error?: string
+  ): void {
+    if (lane === "judge") {
+      this.setFallbackJudge(key, opts, status === "expired" ? "expired" : "ready", error);
+    } else if (lane === "director") {
+      this.setFallbackDirector(key, status, error);
+    } else {
+      this.setFallbackContent(key, opts, status === "expired" ? "expired" : "ready", error);
+    }
+  }
+
+  private commitRuntimeLaneResult(
+    key: string,
+    lane: "judge" | "director" | "content",
+    opts: Record<string, any>,
+    raw: Record<string, any>
+  ): void {
+    const payload = raw?.data && typeof raw.data === "object" && !Array.isArray(raw.data)
+      ? raw.data
+      : raw;
+    if (lane === "judge") {
+      const allowed = Array.isArray(opts.allowedVerdicts)
+        ? opts.allowedVerdicts.filter((v: unknown): v is string => typeof v === "string")
+        : [];
+      const verdict = typeof payload.verdict === "string" && allowed.includes(payload.verdict)
+        ? payload.verdict
+        : this.pickFallbackVerdict(allowed);
+      this.judgeSlots.set(key, {
+        status: "ready",
+        verdict,
+        confidence: typeof payload.confidence === "number" ? payload.confidence : undefined,
+        reason: payload.reason == null ? undefined : String(payload.reason),
+        source: "ai",
+        error: verdict === payload.verdict ? undefined : "verdict outside allowed set",
+      });
+      return;
+    }
+    if (lane === "director") {
+      const allowed = Array.isArray(opts.allowedEffects)
+        ? opts.allowedEffects.filter((v: unknown): v is string => typeof v === "string")
+        : [];
+      const proposalType = payload.proposalType == null ? "" : String(payload.proposalType);
+      if (!proposalType || !allowed.includes(proposalType)) {
+        this.setFallbackDirector(key, "failed", "proposal outside allowed effects");
+        return;
+      }
+      this.directorSlots.set(key, {
+        status: "ready",
+        proposalType,
+        payload: payload.payload && typeof payload.payload === "object" ? payload.payload : undefined,
+        rationale: payload.rationale == null ? undefined : String(payload.rationale),
+        source: "ai",
+      });
+      return;
+    }
+    this.contentSlots.set(key, {
+      status: "ready",
+      data: payload.data !== undefined ? payload.data : raw?.data,
+      text: payload.text == null ? opts.fallbackText ?? null : String(payload.text),
+      source: "ai",
+    });
   }
 
   onDead(cb: (session: SimSession) => void): void {
@@ -726,7 +1044,7 @@ export class SimSession {
 
   private buildSimContext(): Record<string, any> {
     const self = this;
-    return {
+    const ctx: Record<string, any> = {
       W: () => 800,
       H: () => 600,
       PHASE_LOBBY: "lobby",
@@ -738,6 +1056,13 @@ export class SimSession {
       getState: () => self.state,
       isHost: () => true,
       getLocalUserId: () => self.userId,
+      getNetworkProfile: () => safeClone(self.gameConfig?.networkProfile || {}),
+      getPredictionStats: () => ({
+        enabled: false,
+        corrections: 0,
+        lastCorrectionMs: 0,
+      }),
+      getRelayRTT: () => self.roomAvgClientRTTMs || 0,
       getRoomInfo: () => ({
         room_key: self.roomKey,
         sync_mode: "server_sim",
@@ -753,30 +1078,44 @@ export class SimSession {
         self.enqueueAction({ type: self.startAction }, self.userId, null);
         return true;
       },
+      hasCapability: (capability: string) => {
+        const caps = self.gameConfig?.capabilities;
+        return Array.isArray(caps) ? caps.includes(String(capability)) : false;
+      },
       sendAction: (action: unknown) => {
         if (!action || typeof action !== "object") return false;
         self.enqueueAction(action as Record<string, any>, self.userId, null);
         return true;
       },
+      sendDecisiveEvent: () => false,
+      getPendingDecisiveEvents: () => [],
       hasWorldSpace: () => false,
       getWorldWidth: () => 800,
       getWorldHeight: () => 600,
+      worldW: () => 800,
+      worldH: () => 600,
       toWorldX: (x: number) => Number(x || 0),
       toWorldY: (y: number) => Number(y || 0),
       toScreenX: (x: number) => Number(x || 0),
       toScreenY: (y: number) => Number(y || 0),
       getScaleX: () => 1,
       getScaleY: () => 1,
+      scaleX: () => 1,
+      scaleY: () => 1,
+      dpr: () => 1,
       showToast: () => {},
       showModal: () => {},
       showTextInput: () => {},
+      hideTextInput: () => {},
       setHud: () => {},
       setUiTree: () => {},
       setTextInput: () => {},
+      clearHud: () => {},
       playSound: () => {},
-      setBgm: () => {},
       stopSound: () => {},
+      setBgm: () => {},
       stopBgm: () => {},
+      setVolume: () => {},
       bindStream: () => false,
       onStreamEvent: () => {},
       unbindStream: () => {},
@@ -797,10 +1136,26 @@ export class SimSession {
         self.requestRuntimeFlavor(key, opts);
       },
       getFlavor: (id: string) => self.flavorSlots.get(String(id || "")) || null,
-      requestJudge: () => {},
-      getJudge: () => null,
-      requestDirector: () => {},
-      getDirectorProposal: () => null,
+      requestJudge: (id: string, opts: Record<string, any> = {}) => {
+        const key = String(id || "");
+        if (!key || self.judgeSlots.has(key)) return;
+        self.requestRuntimeJudge(key, opts);
+      },
+      getJudge: (id: string) => self.judgeSlots.get(String(id || "")) || null,
+      requestDirector: (id: string, opts: Record<string, any> = {}) => {
+        const key = String(id || "");
+        if (!key || self.directorSlots.has(key)) return;
+        self.requestRuntimeDirector(key, opts);
+      },
+      getDirectorProposal: (id: string) =>
+        self.directorSlots.get(String(id || "")) || null,
+      requestContent: (id: string, opts: Record<string, any> = {}) => {
+        const key = String(id || "");
+        if (!key || self.contentSlots.has(key)) return;
+        self.requestRuntimeContent(key, opts);
+      },
+      getContent: (id: string) => self.contentSlots.get(String(id || "")) || null,
+      requestProfiles: () => {},
       // Mirror game-sdk.js's ctx.getGameData (game-sdk.js:4042-4046).
       //
       // Trivia Roulette 286a7348 incident (2026-04-23): without this,
@@ -829,6 +1184,53 @@ export class SimSession {
         }
         return key ? (data as Record<string, any>)[key] : data;
       },
+      getPlayerCount: () =>
+        Object.entries(self.players).filter(([uid, info]) =>
+          self.shouldIncludeInGameState(uid, info)
+        ).length,
+      spawnBot: (opts: Record<string, any> = {}) => self.spawnPlatformBot(opts),
+      despawnBot: (idOrName?: string) => self.despawnPlatformBot(idOrName),
+      isBot: (userId: string) =>
+        isPlatformBotInfo(String(userId || ""), self.players[String(userId || "")]),
+      setBotBlackboard: (idOrName: string, blackboard: Record<string, any>) =>
+        self.setBotBlackboard(idOrName, blackboard),
+      getBotAction: (idOrName?: string) => self.getBotAction(idOrName),
+      clearBotBlackboard: (idOrName?: string) => self.clearBotBlackboard(idOrName),
+      getAsset: () => null,
+      getAssetUrl: () => null,
+      getAssetNames: () => [],
+      isRealPlayer: (userId: string) => {
+        const id = String(userId || "");
+        return !!id && !isBotUser(id);
+      },
+      isSpectator: (userId: string) => {
+        const info = self.players[String(userId || "")];
+        return !!(info?.role === "spectator" || info?.spectator);
+      },
+      getMaxPlayers: () => Number(self.gameConfig?.maxPlayers || 0),
+      fillRoundRect: () => {},
+      strokeRoundRect: () => {},
+      drawCard: () => {},
+      drawButton: () => {},
+      drawProgressBar: () => {},
+      drawText: () => {},
+      drawCircle: () => {},
+      fillGradient: () => {},
+      drawSprite: () => {},
+      drawBackground: () => {},
+      drawTile: () => {},
+      drawVideo: () => {},
+      screenShake: () => {},
+      setVideo: () => {},
+      locale: "en",
+      fontStack: "system-ui, sans-serif",
+      t: (key: string) => String(key),
+      formatNumber: (value: number) => String(value),
+      lerp: (a: number, b: number, t: number) => a + (b - a) * t,
+      easeOut: (t: number) => 1 - Math.pow(1 - t, 3),
+      easeInOut: (t: number) =>
+        t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2,
+      lerpColor: (_a: string, b: string) => b,
       input: {
         up: false,
         down: false,
@@ -851,13 +1253,293 @@ export class SimSession {
         },
       },
     };
+    this.applyRuntimeContractDefaults(ctx);
+    return ctx;
+  }
+
+  private applyRuntimeContractDefaults(ctx: Record<string, any>): void {
+    for (const [apiName, rawContract] of Object.entries(CTX_RUNTIME_CONTRACT)) {
+      const contract = rawContract as ServerSimRuntimeContractEntry;
+      const support = this.normalizeServerSimSupport(contract.serverSim);
+      if (support === "unsupported") continue;
+      if (ctx[apiName] !== undefined) continue;
+      const fallback = this.defaultRuntimeContractValue(apiName, contract, support);
+      if (fallback !== undefined) {
+        ctx[apiName] = fallback;
+      }
+    }
+  }
+
+  private normalizeServerSimSupport(
+    support: ServerSimRuntimeSupport | undefined
+  ): ServerSimRuntimeSupport {
+    return support === "supported" ? "implemented" : support || "unsupported";
+  }
+
+  private defaultRuntimeContractValue(
+    apiName: string,
+    contract: ServerSimRuntimeContractEntry,
+    support: ServerSimRuntimeSupport
+  ): any {
+    if (apiName === "locale") return "en";
+    if (apiName === "fontStack") return "system-ui, sans-serif";
+    if (support === "noop") return () => undefined;
+    if (support === "fallback") {
+      if (contract.lane === "render_helper") return () => 0;
+      return () => null;
+    }
+    if (contract.lane === "pure_helper") {
+      return (...args: any[]) => args[0];
+    }
+    return undefined;
+  }
+
+  private normalizePlatformBotId(idOrName: unknown): string {
+    const raw = String(idOrName || DEFAULT_PLATFORM_BOT_NAME)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    const name = raw || DEFAULT_PLATFORM_BOT_NAME;
+    return name.startsWith(PLATFORM_BOT_PREFIX) ? name : `${PLATFORM_BOT_PREFIX}${name}`;
+  }
+
+  private spawnPlatformBot(opts: Record<string, any> = {}): string {
+    const requestedName = String(opts.name || opts.displayName || DEFAULT_PLATFORM_BOT_NAME).trim() || DEFAULT_PLATFORM_BOT_NAME;
+    const botName = requestedName.toLowerCase() === DEFAULT_PLATFORM_BOT_NAME ? DEFAULT_PLATFORM_BOT_NAME : requestedName;
+    const userId = this.normalizePlatformBotId(opts.id || botName);
+    const existing = this.players[userId];
+    this.players[userId] = {
+      ...(existing || {}),
+      user_id: userId,
+      role: "bot",
+      name: botName,
+      display_name: botName,
+      online: true,
+      spectator: false,
+      bot: true,
+    };
+    this.syncPlayersToState();
+    return userId;
+  }
+
+  private despawnPlatformBot(idOrName?: string): boolean {
+    const userId = this.normalizePlatformBotId(idOrName || DEFAULT_PLATFORM_BOT_NAME);
+    const info = this.players[userId];
+    if (!isPlatformBotInfo(userId, info)) return false;
+    delete this.players[userId];
+    this.botBlackboards.delete(userId);
+    if (this.lastProcessedInputs[userId] !== undefined) {
+      delete this.lastProcessedInputs[userId];
+      this.lastProcessedInputsDirty = true;
+    }
+    if (this.state?.players && this.state.players[userId]) {
+      delete this.state.players[userId];
+    }
+    return true;
+  }
+
+  private setBotBlackboard(
+    idOrName: string | undefined,
+    blackboard: Record<string, any> | null | undefined
+  ): boolean {
+    if (!blackboard || typeof blackboard !== "object" || Array.isArray(blackboard)) {
+      return false;
+    }
+    const userId = this.normalizePlatformBotId(idOrName || DEFAULT_PLATFORM_BOT_NAME);
+    if (!isPlatformBotInfo(userId, this.players[userId])) {
+      const suffix = userId.startsWith(PLATFORM_BOT_PREFIX)
+        ? userId.slice(PLATFORM_BOT_PREFIX.length)
+        : DEFAULT_PLATFORM_BOT_NAME;
+      this.spawnPlatformBot({ id: userId, name: suffix || DEFAULT_PLATFORM_BOT_NAME });
+    }
+    this.botBlackboards.set(userId, safeClone(blackboard));
+    return true;
+  }
+
+  private getBotAction(idOrName?: string): Record<string, any> | null {
+    const userId = this.normalizePlatformBotId(idOrName || DEFAULT_PLATFORM_BOT_NAME);
+    const blackboard = this.botBlackboards.get(userId);
+    if (!blackboard || typeof blackboard !== "object") return null;
+
+    const fallback = this.asAction(blackboard.fallbackAction) || this.asAction(blackboard.fallback);
+    const actions = Array.isArray(blackboard.actions)
+      ? blackboard.actions
+          .map((action) => this.asAction(action))
+          .filter((action): action is Record<string, any> => !!action)
+      : [];
+    if (!actions.length) return fallback ? safeClone(fallback) : null;
+
+    const kind = String(blackboard.kind || blackboard.type || "choice").toLowerCase();
+    let selected: Record<string, any> | null = null;
+    if (kind === "grid" || kind === "target" || kind === "navigation" || kind === "continuous") {
+      selected = this.selectSpatialBotAction(blackboard, actions, kind === "target" || kind === "continuous");
+    }
+    if (!selected) {
+      selected = this.selectChoiceBotAction(actions);
+    }
+    return selected ? safeClone(selected) : fallback ? safeClone(fallback) : null;
+  }
+
+  private clearBotBlackboard(idOrName?: string): boolean {
+    const userId = this.normalizePlatformBotId(idOrName || DEFAULT_PLATFORM_BOT_NAME);
+    return this.botBlackboards.delete(userId);
+  }
+
+  private asAction(value: unknown): Record<string, any> | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return value as Record<string, any>;
+  }
+
+  private selectChoiceBotAction(actions: Record<string, any>[]): Record<string, any> | null {
+    let best: BotActionCandidate | null = null;
+    for (let i = 0; i < actions.length; i += 1) {
+      const action = actions[i];
+      const score = this.numericPreference(action);
+      const candidate = { action, index: i, score };
+      if (!best || this.compareBotCandidates(candidate, best) < 0) {
+        best = candidate;
+      }
+    }
+    return best?.action || actions[0] || null;
+  }
+
+  private selectSpatialBotAction(
+    blackboard: Record<string, any>,
+    actions: Record<string, any>[],
+    continuous: boolean
+  ): Record<string, any> | null {
+    const self = this.extractPoint(blackboard.self) ||
+      this.extractPoint(blackboard.actor) ||
+      this.extractPoint(blackboard.position);
+    if (!self) return null;
+
+    const targets = this.extractPointList(
+      blackboard.targets || blackboard.objectives || blackboard.goals || blackboard.food
+    );
+    const hazards = this.extractPointList(
+      blackboard.hazards || blackboard.blocks || blackboard.obstacles || blackboard.enemies
+    );
+    const width = this.optionalNumber(blackboard.width ?? blackboard.gridW ?? blackboard.cols);
+    const height = this.optionalNumber(blackboard.height ?? blackboard.gridH ?? blackboard.rows);
+
+    let best: BotActionCandidate | null = null;
+    for (let i = 0; i < actions.length; i += 1) {
+      const action = actions[i];
+      const next = this.nextPointForAction(self, action);
+      if (!next) continue;
+      let score = this.numericPreference(action);
+
+      if (targets.length) {
+        let bestTarget = Number.POSITIVE_INFINITY;
+        for (const target of targets) {
+          const d = continuous
+            ? Math.hypot(next.x - target.x, next.y - target.y)
+            : Math.abs(next.x - target.x) + Math.abs(next.y - target.y);
+          bestTarget = Math.min(bestTarget, d);
+        }
+        score -= bestTarget * 10;
+      }
+
+      for (const hazard of hazards) {
+        const d = continuous
+          ? Math.hypot(next.x - hazard.x, next.y - hazard.y)
+          : Math.abs(next.x - hazard.x) + Math.abs(next.y - hazard.y);
+        if (d === 0) score -= 10000;
+        else if (d <= 1) score -= 60;
+      }
+
+      if (width !== null && (next.x < 0 || next.x >= width)) score -= 10000;
+      if (height !== null && (next.y < 0 || next.y >= height)) score -= 10000;
+
+      const candidate = { action, index: i, score };
+      if (!best || this.compareBotCandidates(candidate, best) < 0) {
+        best = candidate;
+      }
+    }
+    return best?.action || null;
+  }
+
+  private compareBotCandidates(a: BotActionCandidate, b: BotActionCandidate): number {
+    if (a.score !== b.score) return b.score - a.score;
+    const aj = JSON.stringify(a.action);
+    const bj = JSON.stringify(b.action);
+    if (aj < bj) return -1;
+    if (aj > bj) return 1;
+    return a.index - b.index;
+  }
+
+  private numericPreference(action: Record<string, any>): number {
+    const keys = ["score", "utility", "priority", "weight", "value"];
+    for (const key of keys) {
+      const n = this.optionalNumber(action[key]);
+      if (n !== null) return n;
+    }
+    return 0;
+  }
+
+  private optionalNumber(value: unknown): number | null {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  private extractPoint(value: unknown): BotPoint | null {
+    if (!value || typeof value !== "object") return null;
+    const record = value as Record<string, any>;
+    const directX = this.optionalNumber(record.x);
+    const directY = this.optionalNumber(record.y);
+    if (directX !== null && directY !== null) return { x: directX, y: directY };
+    return (
+      this.extractPoint(record.position) ||
+      this.extractPoint(record.pos) ||
+      this.extractPoint(record.head) ||
+      this.extractPoint(record.cell)
+    );
+  }
+
+  private extractPointList(value: unknown): BotPoint[] {
+    if (!value) return [];
+    const raw = Array.isArray(value) ? value : [value];
+    return raw
+      .map((item) => this.extractPoint(item))
+      .filter((point): point is BotPoint => !!point);
+  }
+
+  private nextPointForAction(self: BotPoint, action: Record<string, any>): BotPoint | null {
+    const point = this.extractPoint(action.to) || this.extractPoint(action.target) || this.extractPoint(action);
+    if (point && (action.x !== undefined || action.y !== undefined || action.to || action.target)) {
+      return point;
+    }
+
+    const move = this.extractMove(action);
+    if (!move) return null;
+    return { x: self.x + move.x, y: self.y + move.y };
+  }
+
+  private extractMove(action: Record<string, any>): BotPoint | null {
+    const directDx = this.optionalNumber(action.dx);
+    const directDy = this.optionalNumber(action.dy);
+    if (directDx !== null || directDy !== null) {
+      return { x: directDx || 0, y: directDy || 0 };
+    }
+    const move = this.extractPoint(action.move) || this.extractPoint(action.velocity);
+    if (move) return move;
+
+    const dir = String(action.dir || action.direction || action.moveDir || "").toLowerCase();
+    if (dir === "u" || dir === "up" || dir === "north") return { x: 0, y: -1 };
+    if (dir === "d" || dir === "down" || dir === "south") return { x: 0, y: 1 };
+    if (dir === "l" || dir === "left" || dir === "west") return { x: -1, y: 0 };
+    if (dir === "r" || dir === "right" || dir === "east") return { x: 1, y: 0 };
+    return null;
   }
 
   private assertRuntimeContractCoverage(): void {
     const missing: string[] = [];
-    for (const [apiName, contract] of Object.entries(CTX_RUNTIME_CONTRACT)) {
-      if (contract.serverSim === "unsupported") continue;
-      if (typeof this.simCtx[apiName] !== "function") {
+    for (const [apiName, rawContract] of Object.entries(CTX_RUNTIME_CONTRACT)) {
+      const contract = rawContract as ServerSimRuntimeContractEntry;
+      const support = this.normalizeServerSimSupport(contract.serverSim);
+      if (support === "unsupported") continue;
+      if (this.simCtx[apiName] === undefined) {
         missing.push(apiName);
       }
     }
@@ -880,6 +1562,9 @@ export class SimSession {
 
   private callInitState(): void {
     this.flavorSlots.clear();
+    this.judgeSlots.clear();
+    this.directorSlots.clear();
+    this.contentSlots.clear();
     if (!this.gameConfig) {
       this.state = { players: {}, _phase: this.phase };
       return;
@@ -1197,7 +1882,8 @@ export class SimSession {
   }
 
   private shouldIncludeInGameState(userId: string, p: SimPlayerInfo): boolean {
-    if (!userId || isBotUser(userId)) return false;
+    if (!userId) return false;
+    if (isBotUser(userId) && !isPlatformBotInfo(userId, p)) return false;
     if (p.role === "spectator" || p.spectator) return false;
     return p.online !== false;
   }

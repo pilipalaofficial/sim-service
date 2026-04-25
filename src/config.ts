@@ -57,6 +57,7 @@ export const config = {
 
   ai: {
     enabled: env("SIM_AI_ENABLED", "0").trim() === "1",
+    runtimeUrl: env("SIM_AI_URL", env("SIM_AI_FLAVOR_URL", "")),
     flavorUrl: env("SIM_AI_FLAVOR_URL", ""),
     secret: env("SIM_AI_SECRET", env("SIM_SERVICE_SECRET", "")),
     timeoutMs: parseInt(env("SIM_AI_TIMEOUT_MS", "12000")),

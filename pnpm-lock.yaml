@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@delta/runtime-contract':
-        specifier: https://github.com/pilipalaofficial/delta-runtime-contract/archive/263151e74c02bf5f72981ee91da86b3c37989772.tar.gz
-        version: https://github.com/pilipalaofficial/delta-runtime-contract/archive/263151e74c02bf5f72981ee91da86b3c37989772.tar.gz
+        specifier: https://github.com/pilipalaofficial/delta-runtime-contract/archive/fd9b669bf3adddf5f83d695c34256ea08a66af94.tar.gz
+        version: https://github.com/pilipalaofficial/delta-runtime-contract/archive/fd9b669bf3adddf5f83d695c34256ea08a66af94.tar.gz
       fastify:
         specifier: ^5.3.3
         version: 5.8.5
@@ -39,9 +39,9 @@ importers:
 
 packages:
 
-  '@delta/runtime-contract@https://github.com/pilipalaofficial/delta-runtime-contract/archive/263151e74c02bf5f72981ee91da86b3c37989772.tar.gz':
-    resolution: {integrity: sha512-3CDY7+qSyFNq5JJs7J6UaKgMTCGLXCtYf0HWZWB3cr0WrodDwdSf5oTrataFXianN3cLD8GcsEdy2fOnp4eMfA==, tarball: https://github.com/pilipalaofficial/delta-runtime-contract/archive/263151e74c02bf5f72981ee91da86b3c37989772.tar.gz}
-    version: 0.1.1
+  '@delta/runtime-contract@https://github.com/pilipalaofficial/delta-runtime-contract/archive/fd9b669bf3adddf5f83d695c34256ea08a66af94.tar.gz':
+    resolution: {integrity: sha512-GDPCJPI1PC1TaAipyMwMW67BgWdnAS1SxEF6Km7FKDJ5usKjMndjWaXSa2YGLEM5nR8rGR6QKXI0QCFowjr86g==, tarball: https://github.com/pilipalaofficial/delta-runtime-contract/archive/fd9b669bf3adddf5f83d695c34256ea08a66af94.tar.gz}
+    version: 0.1.4
 
   '@esbuild/aix-ppc64@0.27.7':
     resolution: {integrity: sha512-EKX3Qwmhz1eMdEJokhALr0YiD0lhQNwDqkPYyPhiSwKrh7/4KRjQc04sZ8db+5DVVnZ1LmbNDI1uAMPEUBnQPg==, tarball: https://registry.npmmirror.com/@esbuild/aix-ppc64/-/aix-ppc64-0.27.7.tgz}
@@ -457,7 +457,7 @@ packages:
 
 snapshots:
 
-  '@delta/runtime-contract@https://github.com/pilipalaofficial/delta-runtime-contract/archive/263151e74c02bf5f72981ee91da86b3c37989772.tar.gz': {}
+  '@delta/runtime-contract@https://github.com/pilipalaofficial/delta-runtime-contract/archive/fd9b669bf3adddf5f83d695c34256ea08a66af94.tar.gz': {}
 
   '@esbuild/aix-ppc64@0.27.7':
     optional: true

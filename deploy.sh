@@ -38,9 +38,9 @@ done
 case "${DEPLOY_ENV}" in
   sg-lab)
     # Do not commit real hosts/keys — set in your shell or CI secrets.
-    REMOTE_HOST="${DEPLOY_SG_LAB_HOST:-}"
-    REMOTE_USER="${DEPLOY_SG_LAB_USER:-ubuntu}"
-    SSH_KEY="${DEPLOY_SSH_KEY:-}"
+    REMOTE_HOST="13.250.114.232"
+    REMOTE_USER="ubuntu"
+    SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/delta2-sg.pem}"
     [[ -z "${REMOTE_HOST}" ]] && err "Set DEPLOY_SG_LAB_HOST (e.g. export DEPLOY_SG_LAB_HOST=1.2.3.4)"
     [[ -z "${SSH_KEY}" || ! -f "${SSH_KEY}" ]] && err "Set DEPLOY_SSH_KEY to your SSH private key path"
     ;;
