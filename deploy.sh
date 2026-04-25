@@ -44,6 +44,12 @@ case "${DEPLOY_ENV}" in
     [[ -z "${REMOTE_HOST}" ]] && err "Set DEPLOY_SG_LAB_HOST (e.g. export DEPLOY_SG_LAB_HOST=1.2.3.4)"
     [[ -z "${SSH_KEY}" || ! -f "${SSH_KEY}" ]] && err "Set DEPLOY_SSH_KEY to your SSH private key path"
     ;;
+  sg-lab-for-allen)
+    REMOTE_HOST="18.143.183.71"
+    REMOTE_USER="ubuntu"
+    SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/Downloads/delta2-sg.pem}"
+    [[ -f "${SSH_KEY}" ]] || err "SSH key not found: ${SSH_KEY}"
+    ;;
   sg-relay-1)
     REMOTE_HOST="13.212.206.252"
     REMOTE_USER="ubuntu"
