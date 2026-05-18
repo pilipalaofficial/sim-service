@@ -144,7 +144,7 @@ do_sync_code() {
     --include='ecosystem.config.example.cjs' \
     --exclude='ecosystem.config.cjs' \
     --exclude='ecosystem.config.*.cjs' \
-    --exclude='node_modules' --exclude='.git' --exclude='.env' \
+    --exclude='node_modules' --exclude='.git' --exclude='.env' --exclude='.omx' \
     -e "${RSYNC_SSH}" \
     "${LOCAL_DIR}/" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
   ok "Code synced"

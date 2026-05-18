@@ -11,3 +11,4 @@ ecosystem.config.cjs
 ecosystem.config.*.cjs
 !ecosystem.config.example.cjs
 !ecosystem.config.sg-lab.cjs
+.omx/

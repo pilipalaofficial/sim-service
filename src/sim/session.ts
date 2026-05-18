@@ -400,13 +400,16 @@ export class SimSession {
   private setFallbackFlavor(
     key: string,
     fallbackText: string | null,
+    fallbackUrl: string | null = null,
     status: "failed" | "expired" = "failed",
     error?: string
   ): void {
     const hasFallback = typeof fallbackText === "string" && fallbackText.trim().length > 0;
+    const hasUrlFallback = typeof fallbackUrl === "string" && fallbackUrl.trim().length > 0;
     this.flavorSlots.set(key, {
-      status: hasFallback ? "ready" : status,
+      status: hasFallback || hasUrlFallback ? "ready" : status,
       text: fallbackText,
+      url: fallbackUrl,
       source: "fallback",
       error,
     });
@@ -414,26 +417,17 @@ export class SimSession {
 
   private requestRuntimeFlavor(key: string, opts: Record<string, any>): void {
     const flavorType = String(opts.type || "text");
-    if (flavorType !== "text") {
-      const fallbackUrl =
-        opts.fallbackUrl == null ? null : String(opts.fallbackUrl);
-      this.flavorSlots.set(key, {
-        status: fallbackUrl == null ? "failed" : "ready",
-        url: fallbackUrl,
-        source: "fallback",
-        error: "unsupported flavor type",
-      });
-      return;
-    }
-
     const fallbackText =
       opts.fallbackText == null ? null : String(opts.fallbackText);
+    const fallbackUrl =
+      opts.fallbackUrl == null ? null : String(opts.fallbackUrl);
     const prompt = String(opts.prompt || "").trim();
     const flavorUrl = this.runtimeAiFlavorUrl || config.ai.flavorUrl;
     if (!config.ai.enabled || !flavorUrl || !prompt) {
       this.setFallbackFlavor(
         key,
         fallbackText,
+        fallbackUrl,
         "failed",
         prompt ? "runtime ai disabled" : "empty prompt"
       );
@@ -443,22 +437,27 @@ export class SimSession {
     this.flavorSlots.set(key, {
       status: "pending",
       text: fallbackText,
+      url: fallbackUrl,
       source: "fallback",
     });
 
-    void this.resolveRuntimeFlavor(key, opts, fallbackText);
+    void this.resolveRuntimeFlavor(key, opts, fallbackText, fallbackUrl, flavorType);
   }
 
   private async resolveRuntimeFlavor(
     key: string,
     opts: Record<string, any>,
-    fallbackText: string | null
+    fallbackText: string | null,
+    fallbackUrl: string | null,
+    flavorType: string
   ): Promise<void> {
+    const defaultCap = flavorType === "video" ? 180000 : flavorType === "image" ? 60000 : 12000;
+    const configuredCap = config.ai.timeoutMs || defaultCap;
     const timeoutMs = Math.max(
       1000,
       Math.min(
-        Number(opts.timeoutMs || config.ai.timeoutMs || 12000),
-        config.ai.timeoutMs || 12000
+        Number(opts.timeoutMs || configuredCap),
+        Math.max(configuredCap, defaultCap)
       )
     );
     const controller = new AbortController();
@@ -467,7 +466,7 @@ export class SimSession {
     try {
       const flavorUrl = this.runtimeAiFlavorUrl || config.ai.flavorUrl;
       if (!flavorUrl) {
-        this.setFallbackFlavor(key, fallbackText, "failed", "runtime ai url missing");
+        this.setFallbackFlavor(key, fallbackText, fallbackUrl, "failed", "runtime ai url missing");
         return;
       }
 
@@ -481,9 +480,11 @@ export class SimSession {
           room_key: this.roomKey,
           game_id: this.gameUrl,
           request_id: key,
-          type: String(opts.type || "text"),
+          type: flavorType,
           prompt: String(opts.prompt || ""),
           fallback_text: fallbackText || "",
+          fallback_url: fallbackUrl || "",
+          duration: Number(opts.duration || 5),
           max_tokens: Number(opts.maxTokens || config.ai.maxTokens || 180),
           timeout_ms: timeoutMs,
         }),
@@ -492,7 +493,7 @@ export class SimSession {
       clearTimeout(timer);
 
       if (!resp.ok) {
-        this.setFallbackFlavor(key, fallbackText, "expired", `ai http ${resp.status}`);
+        this.setFallbackFlavor(key, fallbackText, fallbackUrl, "expired", `ai http ${resp.status}`);
         return;
       }
 
@@ -501,6 +502,7 @@ export class SimSession {
         this.setFallbackFlavor(
           key,
           fallbackText,
+          fallbackUrl,
           "failed",
           body?.error_message ? String(body.error_message) : "ai broker error"
         );
@@ -509,12 +511,14 @@ export class SimSession {
       const data = body?.data || body;
       const status = String(data?.status || "");
       const text = data?.text == null ? "" : String(data.text);
+      const url = data?.url == null ? "" : String(data.url);
       const source = data?.source === "ai" ? "ai" : "fallback";
 
-      if (status === "ready" && text.trim()) {
+      if (status === "ready" && (text.trim() || url.trim())) {
         this.flavorSlots.set(key, {
           status: "ready",
-          text,
+          text: text || fallbackText,
+          url: url || fallbackUrl,
           source,
         });
         return;
@@ -523,13 +527,14 @@ export class SimSession {
       this.setFallbackFlavor(
         key,
         text.trim() ? text : fallbackText,
+        url.trim() ? url : fallbackUrl,
         status === "expired" ? "expired" : "failed",
-        data?.error ? String(data.error) : "ai returned no ready text"
+        data?.error ? String(data.error) : "ai returned no ready flavor"
       );
     } catch (err) {
       clearTimeout(timer);
       const message = err instanceof Error ? err.message : String(err);
-      this.setFallbackFlavor(key, fallbackText, "expired", message);
+      this.setFallbackFlavor(key, fallbackText, fallbackUrl, "expired", message);
       this.logger.warn(`[sim] runtime ai flavor failed room=${this.roomKey} id=${key}`, err);
     }
   }
@@ -1603,27 +1608,58 @@ export class SimSession {
         this.phase = mapped;
       }
     }
-    // server_sim 根治闪烁：与 game-sdk 的 _phase 规则并行，识别「对局已结束」的常用布尔/状态字段。
-    // 多数 AI 游戏在结算时只设 gameOver / winner，不写 _phase（本地模式靠全量渲染，不依赖高频网络快照）。
-    // 这里一旦进入 result，stepTick 早退，不再推送 tick 级 state_sync。
+    // Keep server_sim lifecycle aligned with game-sdk: generated games may
+    // expose terminal state via isGameOver() or durable state flags.
     this.applyTerminalPhaseFromGameplayFlags();
     this.state._phase = this.phase;
   }
 
-  /** 与 mapToSdkPhase 互补：仅接受明确「已结束」信号，避免猜测业务字段。 */
+  /** Complements mapToSdkPhase: accept only explicit terminal signals. */
   private applyTerminalPhaseFromGameplayFlags(): void {
     if (this.phase !== "playing") return;
     const s = this.state;
     if (!s || typeof s !== "object") return;
-    if (s.gameOver === true || s.game_over === true || s.ended === true) {
+
+    if (this.gameConfig && typeof this.gameConfig.isGameOver === "function") {
+      try {
+        if (this.gameConfig.isGameOver(s, this.simCtx) === true) {
+          this.phase = "result";
+          return;
+        }
+      } catch (err) {
+        this.logger.warn(`[sim] isGameOver error room=${this.roomKey}`, err);
+      }
+    }
+
+    if (
+      s.gameOver === true ||
+      s.game_over === true ||
+      s.finished === true ||
+      s.ended === true ||
+      s.done === true ||
+      s.complete === true ||
+      s.completed === true ||
+      s.isGameOver === true
+    ) {
       this.phase = "result";
       return;
     }
-    const st = s.status;
-    if (typeof st === "string") {
-      const u = st.toLowerCase().trim();
-      if (u === "finished" || u === "gameover" || u === "ended") {
+    const terminalStrings = [s.status, s.gamePhase];
+    for (const value of terminalStrings) {
+      if (typeof value !== "string") continue;
+      const u = value.toLowerCase().trim();
+      if (
+        u === "result" ||
+        u === "finished" ||
+        u === "gameover" ||
+        u === "game_over" ||
+        u === "ended" ||
+        u === "done" ||
+        u === "complete" ||
+        u === "completed"
+      ) {
         this.phase = "result";
+        return;
       }
     }
   }
