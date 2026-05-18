@@ -83,6 +83,7 @@ interface SimFlavorSlot {
   status: "pending" | "ready" | "failed" | "expired";
   text?: string | null;
   url?: string | null;
+  result?: unknown;
   source: "ai" | "fallback";
   error?: string;
 }
@@ -159,6 +160,55 @@ function isBotUser(userId: string): boolean {
 function isPlatformBotInfo(userId: string, info: SimPlayerInfo | undefined): boolean {
   if (!userId || !info) return false;
   return info.bot === true || info.role === "bot";
+}
+
+function isGameManagedPlayerState(userId: string, value: unknown): boolean {
+  const id = String(userId || "").toLowerCase();
+  if (
+    id.startsWith("__ai") ||
+    id.startsWith("__bot") ||
+    id.startsWith("__npc") ||
+    id.startsWith("ai_") ||
+    id.startsWith("bot_") ||
+    id.startsWith("npc_")
+  ) {
+    return true;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, any>;
+  if (
+    record.isAI === true ||
+    record.isAi === true ||
+    record.ai === true ||
+    record.isBot === true ||
+    record.bot === true ||
+    record.isNPC === true ||
+    record.npc === true ||
+    record.cpu === true ||
+    record.isCpu === true
+  ) {
+    return true;
+  }
+  const role = String(record.role || record.kind || record.type || "").toLowerCase();
+  return role === "ai" || role === "bot" || role === "npc" || role === "cpu";
+}
+
+function ensureRngState(state: Record<string, any> | null | undefined): Record<string, any> | null {
+  if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+  const raw = Number(state.rngSeed);
+  state.rngSeed = (Number.isFinite(raw) ? raw : 123456789) >>> 0;
+  return state;
+}
+
+function nextDeterministicRandom(state: Record<string, any> | null | undefined): number {
+  const target = ensureRngState(state);
+  if (!target) return 0.5;
+  const seed = (((target.rngSeed >>> 0) || 123456789) + 0x6D2B79F5) >>> 0;
+  let t = seed;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  target.rngSeed = seed >>> 0;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
 
 // Default PHASE_MACHINE matches assembled game-sdk.js (lobby / playing / result).
@@ -402,7 +452,8 @@ export class SimSession {
     fallbackText: string | null,
     fallbackUrl: string | null = null,
     status: "failed" | "expired" = "failed",
-    error?: string
+    error?: string,
+    fallbackResult?: unknown
   ): void {
     const hasFallback = typeof fallbackText === "string" && fallbackText.trim().length > 0;
     const hasUrlFallback = typeof fallbackUrl === "string" && fallbackUrl.trim().length > 0;
@@ -410,6 +461,7 @@ export class SimSession {
       status: hasFallback || hasUrlFallback ? "ready" : status,
       text: fallbackText,
       url: fallbackUrl,
+      result: fallbackResult,
       source: "fallback",
       error,
     });
@@ -421,6 +473,10 @@ export class SimSession {
       opts.fallbackText == null ? null : String(opts.fallbackText);
     const fallbackUrl =
       opts.fallbackUrl == null ? null : String(opts.fallbackUrl);
+    const fallbackResult =
+      Object.prototype.hasOwnProperty.call(opts, "fallbackResult")
+        ? opts.fallbackResult
+        : undefined;
     const prompt = String(opts.prompt || "").trim();
     const flavorUrl = this.runtimeAiFlavorUrl || config.ai.flavorUrl;
     if (!config.ai.enabled || !flavorUrl || !prompt) {
@@ -429,7 +485,8 @@ export class SimSession {
         fallbackText,
         fallbackUrl,
         "failed",
-        prompt ? "runtime ai disabled" : "empty prompt"
+        prompt ? "runtime ai disabled" : "empty prompt",
+        fallbackResult
       );
       return;
     }
@@ -438,6 +495,7 @@ export class SimSession {
       status: "pending",
       text: fallbackText,
       url: fallbackUrl,
+      result: fallbackResult,
       source: "fallback",
     });
 
@@ -466,7 +524,14 @@ export class SimSession {
     try {
       const flavorUrl = this.runtimeAiFlavorUrl || config.ai.flavorUrl;
       if (!flavorUrl) {
-        this.setFallbackFlavor(key, fallbackText, fallbackUrl, "failed", "runtime ai url missing");
+        this.setFallbackFlavor(
+          key,
+          fallbackText,
+          fallbackUrl,
+          "failed",
+          "runtime ai url missing",
+          opts.fallbackResult
+        );
         return;
       }
 
@@ -493,7 +558,14 @@ export class SimSession {
       clearTimeout(timer);
 
       if (!resp.ok) {
-        this.setFallbackFlavor(key, fallbackText, fallbackUrl, "expired", `ai http ${resp.status}`);
+        this.setFallbackFlavor(
+          key,
+          fallbackText,
+          fallbackUrl,
+          "expired",
+          `ai http ${resp.status}`,
+          opts.fallbackResult
+        );
         return;
       }
 
@@ -504,7 +576,8 @@ export class SimSession {
           fallbackText,
           fallbackUrl,
           "failed",
-          body?.error_message ? String(body.error_message) : "ai broker error"
+          body?.error_message ? String(body.error_message) : "ai broker error",
+          opts.fallbackResult
         );
         return;
       }
@@ -513,12 +586,21 @@ export class SimSession {
       const text = data?.text == null ? "" : String(data.text);
       const url = data?.url == null ? "" : String(data.url);
       const source = data?.source === "ai" ? "ai" : "fallback";
+      const result =
+        data?.result !== undefined
+          ? data.result
+          : data?.json !== undefined
+            ? data.json
+            : opts.fallbackResult !== undefined
+              ? opts.fallbackResult
+              : text;
 
       if (status === "ready" && (text.trim() || url.trim())) {
         this.flavorSlots.set(key, {
           status: "ready",
           text: text || fallbackText,
           url: url || fallbackUrl,
+          result,
           source,
         });
         return;
@@ -529,12 +611,13 @@ export class SimSession {
         text.trim() ? text : fallbackText,
         url.trim() ? url : fallbackUrl,
         status === "expired" ? "expired" : "failed",
-        data?.error ? String(data.error) : "ai returned no ready flavor"
+        data?.error ? String(data.error) : "ai returned no ready flavor",
+        opts.fallbackResult
       );
     } catch (err) {
       clearTimeout(timer);
       const message = err instanceof Error ? err.message : String(err);
-      this.setFallbackFlavor(key, fallbackText, fallbackUrl, "expired", message);
+      this.setFallbackFlavor(key, fallbackText, fallbackUrl, "expired", message, opts.fallbackResult);
       this.logger.warn(`[sim] runtime ai flavor failed room=${this.roomKey} id=${key}`, err);
     }
   }
@@ -1094,6 +1177,36 @@ export class SimSession {
       },
       sendDecisiveEvent: () => false,
       getPendingDecisiveEvents: () => [],
+      random: (stateArg?: Record<string, any>) =>
+        nextDeterministicRandom(
+          stateArg && typeof stateArg === "object" ? stateArg : self.state
+        ),
+      randomFloat: (min = 0, max = 1, stateArg?: Record<string, any>) => {
+        const lo = Number.isFinite(Number(min)) ? Number(min) : 0;
+        const hi = Number.isFinite(Number(max)) ? Number(max) : 1;
+        return lo + (hi - lo) * nextDeterministicRandom(
+          stateArg && typeof stateArg === "object" ? stateArg : self.state
+        );
+      },
+      randomInt: (min: number, max: number, stateArg?: Record<string, any>) => {
+        let lo = Math.ceil(Number(min));
+        let hi = Math.floor(Number(max));
+        if (!Number.isFinite(lo)) lo = 0;
+        if (!Number.isFinite(hi)) hi = lo;
+        if (hi < lo) [lo, hi] = [hi, lo];
+        return lo + Math.floor(nextDeterministicRandom(
+          stateArg && typeof stateArg === "object" ? stateArg : self.state
+        ) * (hi - lo + 1));
+      },
+      pickRandom: (items: unknown[], stateArg?: Record<string, any>) => {
+        if (!Array.isArray(items) || items.length === 0) return null;
+        let lo = 0;
+        let hi = items.length - 1;
+        const index = lo + Math.floor(nextDeterministicRandom(
+          stateArg && typeof stateArg === "object" ? stateArg : self.state
+        ) * (hi - lo + 1));
+        return items[index] ?? null;
+      },
       hasWorldSpace: () => false,
       getWorldWidth: () => 800,
       getWorldHeight: () => 600,
@@ -1129,6 +1242,29 @@ export class SimSession {
         status: "error",
         error: "askAI is unavailable in sim runtime",
       }),
+      requestAI: (id: string, opts: Record<string, any> = {}) => {
+        const key = String(id || "");
+        if (!key) return;
+        if (self.flavorSlots.get(key)) return;
+
+        const hasFallback = Object.prototype.hasOwnProperty.call(opts, "fallback");
+        const fallbackResult = hasFallback ? opts.fallback : undefined;
+        let fallbackText =
+          opts.fallbackText == null ? null : String(opts.fallbackText);
+        if (fallbackText == null && fallbackResult !== undefined && fallbackResult !== null) {
+          fallbackText =
+            typeof fallbackResult === "string"
+              ? fallbackResult
+              : JSON.stringify(fallbackResult);
+        }
+
+        self.requestRuntimeFlavor(key, {
+          ...opts,
+          fallbackText,
+          fallbackResult,
+        });
+      },
+      getAIResult: (id: string) => self.flavorSlots.get(String(id || "")) || null,
       requestFlavor: (id: string, opts: Record<string, any> = {}) => {
         const key = String(id || "");
         if (!key) return;
@@ -1586,6 +1722,40 @@ export class SimSession {
     this.syncPlayersToState();
   }
 
+  private restartRound(userId: string, reason: string): void {
+    this.callInitState();
+    this.setPhase("lobby");
+
+    if (this.gameConfig && typeof this.gameConfig.onAction === "function") {
+      const startedAtMs = Date.now();
+      try {
+        const next = this.gameConfig.onAction(
+          this.state,
+          { type: this.startAction, user_id: userId },
+          userId,
+          this.simCtx
+        );
+        if (next && typeof next === "object" && next !== this.state) {
+          this.state = next as Record<string, any>;
+        }
+      } catch (err) {
+        this.logger.warn(
+          `[sim] restart start action error room=${this.roomKey} reason=${reason} user=${userId}`,
+          err
+        );
+      } finally {
+        this.observeRuntimeBudget("onAction", startedAtMs, {
+          action: this.startAction,
+          userId,
+          reason,
+        });
+      }
+    }
+
+    this.ensureStateShape();
+    this.setPhase("playing");
+  }
+
   private ensureStateShape(): void {
     if (
       !this.state ||
@@ -1756,6 +1926,21 @@ export class SimSession {
         this.roomRTTSamples = Number.isFinite(samples) && samples > 0 ? Math.floor(samples) : 0;
         return;
       }
+      case "room_reset": {
+        const payload = (raw.payload || {}) as Record<string, any>;
+        const sourceUserId = String(
+          raw.source_user_id ||
+            raw.from_user_id ||
+            raw.user_id ||
+            payload.user_id ||
+            raw.from ||
+            this.userId ||
+            ""
+        );
+        this.restartRound(sourceUserId, "room_reset");
+        this.pushStateSyncIfChanged("room_reset");
+        return;
+      }
       default:
         return;
     }
@@ -1841,8 +2026,9 @@ export class SimSession {
         this.setPhase("playing");
       }
       if (kind === "RESTART") {
-        this.callInitState();
-        this.setPhase("lobby");
+        this.restartRound(item.userId, "restart_action");
+        this.ackProcessedInput(item.userId, item.inputId);
+        continue;
       }
 
       const startedAtMs = Date.now();
@@ -1945,6 +2131,7 @@ export class SimSession {
     for (const uid of Object.keys(existing)) {
       const info = this.players[uid];
       if (!info || !this.shouldIncludeInGameState(uid, info)) {
+        if (isGameManagedPlayerState(uid, existing[uid])) continue;
         delete this.state.players[uid];
       }
     }
