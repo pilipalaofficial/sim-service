@@ -152,6 +152,7 @@ const COALESCIBLE_CONTINUOUS_ACTIONS = new Set([
   "WALK",
   "RUN",
 ]);
+const BOOTSTRAP_ACTION_GATE_TIMEOUT_MS = 1500;
 
 function isBotUser(userId: string): boolean {
   return BOT_PREFIXES.some((p) => userId.startsWith(p));
@@ -400,6 +401,8 @@ export class SimSession {
   private pendingSync = false;
   private lastStateSyncAt = 0;
   private lastSyncedPhase: "lobby" | "playing" | "result" | "" = "";
+  private bootstrapReady = false;
+  private bootstrapGateWarned = false;
   private roomAvgClientRTTMs = 0;
   private roomMaxClientRTTMs = 0;
   private roomRTTSamples = 0;
@@ -952,6 +955,8 @@ export class SimSession {
     this.lifecycle = "activating";
     this._activatedAt = Date.now();
     this._lastEventAt = this._activatedAt;
+    this.bootstrapReady = false;
+    this.bootstrapGateWarned = false;
     this.relayClient.connect();
     if (!this.tickTimer) {
       this.tickTimer = setInterval(
@@ -1104,9 +1109,13 @@ export class SimSession {
     });
     this.relayClient.on("connected", () => {
       this._relayDisconnectCount = 0;
-      this.flushPendingStateSync("relay_connected");
+      if (this.bootstrapReady) {
+        this.flushPendingStateSync("relay_connected");
+      }
     });
     this.relayClient.on("disconnected", () => {
+      this.bootstrapReady = false;
+      this.bootstrapGateWarned = false;
       if (this.lifecycle === "stopped") {
         return;
       }
@@ -1824,7 +1833,15 @@ export class SimSession {
     }
     this._lastEventAt = Date.now();
     this.syncPlayersToState();
+    this.bootstrapReady = true;
+    this.bootstrapGateWarned = false;
+    const drained = this.drainActionQueue();
     this.pushStateSyncIfChanged("bootstrap");
+    if (drained > 0) {
+      this.logger.debug(
+        `[sim] pending actions drained after bootstrap room=${this.roomKey} count=${drained}`
+      );
+    }
   }
 
   private handleRelayMessage(msg: RelayMessage): void {
@@ -1849,8 +1866,8 @@ export class SimSession {
         );
         if (!sourceUserId) return;
         this.enqueueAction(action, sourceUserId, inputId);
-        this.drainActionQueue();
-        if (!this.isCoalescibleRealtimeAction(action)) {
+        const drained = this.drainActionQueue();
+        if (drained > 0 && !this.isCoalescibleRealtimeAction(action)) {
           this.pushStateSyncIfChanged("player_action");
         }
         return;
@@ -1976,15 +1993,52 @@ export class SimSession {
       : null;
   }
 
-  private drainActionQueue(): void {
+  private isActionProcessingReady(): boolean {
+    if (this.lifecycle !== "active" || this.bootstrapReady) return true;
+    if (this.actionQueue.length === 0) return false;
+    const activatedAt = this._activatedAt || Date.now();
+    if (Date.now() - activatedAt >= BOOTSTRAP_ACTION_GATE_TIMEOUT_MS) {
+      this.bootstrapReady = true;
+      if (!this.bootstrapGateWarned) {
+        this.bootstrapGateWarned = true;
+        this.logger.warn(
+          `[sim] bootstrap wait timed out; processing queued actions fail-open room=${this.roomKey} queued_actions=${this.actionQueue.length}`
+        );
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private ensureActionPlayerKnown(userId: string): void {
+    const uid = String(userId || "");
+    if (!uid || isBotUser(uid)) return;
+    const existing = this.players[uid];
+    if (existing && this.shouldIncludeInGameState(uid, existing)) return;
+    this.players[uid] = {
+      ...(existing || {}),
+      user_id: uid,
+      role: existing?.role || "client",
+      name: existing?.name || "",
+      online: true,
+      spectator: false,
+    };
+  }
+
+  private drainActionQueue(): number {
+    if (!this.isActionProcessingReady()) {
+      return 0;
+    }
+    let processed = 0;
     if (!this.gameConfig || typeof this.gameConfig.onAction !== "function") {
       while (this.actionQueue.length > 0) {
         const item = this.actionQueue.shift();
         if (!item) continue;
         this.ackProcessedInput(item.userId, item.inputId);
+        processed++;
       }
       this.actionQueue.length = 0;
-      return;
+      return processed;
     }
     while (this.actionQueue.length > 0) {
       const item = this.actionQueue.shift();
@@ -2000,11 +2054,14 @@ export class SimSession {
       if (kind === "RESTART") {
         this.restartRound(item.userId, "restart_action");
         this.ackProcessedInput(item.userId, item.inputId);
+        processed++;
         continue;
       }
 
       const startedAtMs = Date.now();
       try {
+        this.ensureActionPlayerKnown(item.userId);
+        this.syncPlayersToState();
         const next = this.gameConfig.onAction(
           this.state,
           safeAction,
@@ -2021,6 +2078,7 @@ export class SimSession {
         );
       } finally {
         this.ackProcessedInput(item.userId, item.inputId);
+        processed++;
         this.observeRuntimeBudget("onAction", startedAtMs, {
           action: kind,
           userId: item.userId,
@@ -2028,14 +2086,16 @@ export class SimSession {
       }
       this.ensureStateShape();
       if (this.isStopped()) {
-        return;
+        return processed;
       }
     }
+    return processed;
   }
 
   private stepTick(): void {
     if (this.lifecycle !== "active") return;
     this.drainActionQueue();
+    if (!this.bootstrapReady) return;
     if (this.phase === "result") {
       // Result phase: only sync once (handled by drainActionQueue/setPhase),
       // then stop ticking to avoid redundant state_sync that causes flickering.
