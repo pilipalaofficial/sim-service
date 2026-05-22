@@ -109,6 +109,7 @@ interface SimDirectorSlot {
 interface SimContentSlot {
   status: "pending" | "ready" | "failed" | "expired";
   data?: any;
+  result?: unknown;
   text?: string | null;
   source: "ai" | "fallback";
   error?: string;
@@ -681,6 +682,7 @@ export class SimSession {
     this.contentSlots.set(key, {
       status: hasFallback ? status : "failed",
       data: opts.fallbackData,
+      result: opts.fallbackData,
       text: opts.fallbackText == null ? null : String(opts.fallbackText),
       source: "fallback",
       error,
@@ -725,6 +727,7 @@ export class SimSession {
     this.contentSlots.set(key, {
       status: "pending",
       data: opts.fallbackData,
+      result: opts.fallbackData,
       text: opts.fallbackText == null ? null : String(opts.fallbackText),
       source: "fallback",
     });
@@ -876,6 +879,12 @@ export class SimSession {
     this.contentSlots.set(key, {
       status: "ready",
       data: payload.data !== undefined ? payload.data : raw?.data,
+      result:
+        payload.result !== undefined
+          ? payload.result
+          : payload.data !== undefined
+            ? payload.data
+            : raw?.data,
       text: payload.text == null ? opts.fallbackText ?? null : String(payload.text),
       source: "ai",
     });
@@ -1254,7 +1263,7 @@ export class SimSession {
       requestAI: (id: string, opts: Record<string, any> = {}) => {
         const key = String(id || "");
         if (!key) return;
-        if (self.flavorSlots.get(key)) return;
+        if (self.contentSlots.get(key)) return;
 
         const hasFallback = Object.prototype.hasOwnProperty.call(opts, "fallback");
         const fallbackResult = hasFallback ? opts.fallback : undefined;
@@ -1267,13 +1276,13 @@ export class SimSession {
               : JSON.stringify(fallbackResult);
         }
 
-        self.requestRuntimeFlavor(key, {
+        self.requestRuntimeContent(key, {
           ...opts,
           fallbackText,
-          fallbackResult,
+          fallbackData: fallbackResult,
         });
       },
-      getAIResult: (id: string) => self.flavorSlots.get(String(id || "")) || null,
+      getAIResult: (id: string) => self.contentSlots.get(String(id || "")) || null,
       requestFlavor: (id: string, opts: Record<string, any> = {}) => {
         const key = String(id || "");
         if (!key) return;

@@ -78,3 +78,24 @@ test("bootstrap gate fails open but still synthesizes action player state", () =
   assert.equal(session.state.players["player-2"].answered, true);
   assert.equal(session.actionQueue.length, 0);
 });
+
+test("generic runtime AI uses content lane in server sim context", () => {
+  const session = makeSession();
+  const ctx = session.simCtx;
+
+  ctx.requestAI("story-summary", {
+    prompt: "Summarize the story",
+    fallback: { summary: "fallback summary", twist: "fallback twist" },
+    timeoutMs: 1000,
+  });
+
+  const ai = ctx.getAIResult("story-summary");
+  assert.equal(ai.status, "ready");
+  assert.equal(ai.source, "fallback");
+  assert.deepEqual(ai.result, {
+    summary: "fallback summary",
+    twist: "fallback twist",
+  });
+  assert.equal(session.contentSlots.has("story-summary"), true);
+  assert.equal(session.flavorSlots.has("story-summary"), false);
+});
