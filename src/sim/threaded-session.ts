@@ -187,6 +187,7 @@ export class ThreadedSimSession {
         roomKey: opts.roomKey,
         gameUrl: opts.gameUrl,
         fallbackGameUrl: opts.fallbackGameUrl,
+        runtimeAiUrl: opts.runtimeAiUrl,
         runtimeAiFlavorUrl: opts.runtimeAiFlavorUrl,
         relayWsUrl: opts.relayWsUrl,
         tickRate: opts.tickRate,
@@ -362,7 +363,17 @@ export class ThreadedSimSession {
       case "log": {
         const level = msg.level || "info";
         const fn = this.logger[level] || this.logger.info;
-        fn.apply(this.logger, msg.args || []);
+        const text = (msg.args || [])
+          .map((arg) => {
+            if (typeof arg === "string") return arg;
+            try {
+              return JSON.stringify(arg);
+            } catch {
+              return String(arg);
+            }
+          })
+          .join(" ");
+        fn.call(this.logger, text);
         return;
       }
     }

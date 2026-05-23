@@ -18,9 +18,9 @@ internal Runtime AI resolver:
 
 ```bash
 SIM_AI_ENABLED=1
-SIM_AI_URL=https://your-api.example.com/api/runtime-ai/resolve
+SIM_AI_URL=https://your-api.example.com/internal/runtime-ai/resolve
 # Legacy alias still works if SIM_AI_URL is unset:
-# SIM_AI_FLAVOR_URL=https://your-api.example.com/api/runtime-ai/resolve
+# SIM_AI_FLAVOR_URL=https://your-api.example.com/internal/runtime-ai/flavor
 SIM_AI_SECRET=the-same-secret-configured-as-RUNTIME_AI_INTERNAL_SECRET
 SIM_AI_TIMEOUT_MS=12000
 SIM_AI_MAX_TOKENS=180

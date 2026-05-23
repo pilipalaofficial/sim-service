@@ -53,9 +53,9 @@ module.exports = {
         // Runtime AI broker. Disabled by default; when enabled, points to the
         // internal resolver that handles flavor/judge/director/content lanes.
         SIM_AI_ENABLED: "0",
-        SIM_AI_URL: "https://your-api.example.com/api/runtime-ai/resolve",
+        SIM_AI_URL: "https://your-api.example.com/internal/runtime-ai/resolve",
         // Legacy alias supported when SIM_AI_URL is unset:
-        // SIM_AI_FLAVOR_URL: "https://your-api.example.com/api/runtime-ai/resolve",
+        // SIM_AI_FLAVOR_URL: "https://your-api.example.com/internal/runtime-ai/flavor",
         SIM_AI_SECRET: "replace-with-runtime-ai-internal-secret",
         SIM_AI_TIMEOUT_MS: "12000",
         SIM_AI_MAX_TOKENS: "180",

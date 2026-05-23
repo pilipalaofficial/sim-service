@@ -18,6 +18,7 @@ export interface SimSessionOptions {
   roomKey: string;
   gameUrl: string;
   fallbackGameUrl?: string;
+  runtimeAiUrl?: string;
   runtimeAiFlavorUrl?: string;
   relayWsUrl?: string;
   tickRate?: number;
@@ -371,6 +372,7 @@ export class SimSession {
   readonly roomKey: string;
   readonly gameUrl: string;
   readonly fallbackGameUrl?: string;
+  readonly runtimeAiResolveUrl?: string;
   readonly runtimeAiFlavorUrl?: string;
   readonly userId: string;
 
@@ -415,6 +417,7 @@ export class SimSession {
   private judgeSlots = new Map<string, SimJudgeSlot>();
   private directorSlots = new Map<string, SimDirectorSlot>();
   private contentSlots = new Map<string, SimContentSlot>();
+  private contentFallbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private botBlackboards = new Map<string, Record<string, any>>();
 
   static readonly MAX_RELAY_DISCONNECTS = 6;
@@ -424,6 +427,7 @@ export class SimSession {
     this.roomKey = opts.roomKey;
     this.gameUrl = opts.gameUrl;
     this.fallbackGameUrl = opts.fallbackGameUrl;
+    this.runtimeAiResolveUrl = opts.runtimeAiUrl;
     this.runtimeAiFlavorUrl = opts.runtimeAiFlavorUrl;
     this.userId = `sim-bot-${this.id.slice(0, 8)}`;
     this.logger = opts.logger;
@@ -627,7 +631,7 @@ export class SimSession {
   }
 
   private runtimeAiUrl(): string {
-    return this.runtimeAiFlavorUrl || config.ai.runtimeUrl || config.ai.flavorUrl;
+    return this.runtimeAiResolveUrl || config.ai.runtimeUrl || this.runtimeAiFlavorUrl || config.ai.flavorUrl;
   }
 
   private pickFallbackVerdict(allowedVerdicts: string[]): string {
@@ -676,17 +680,57 @@ export class SimSession {
     status: "ready" | "failed" | "expired" = "ready",
     error?: string
   ): void {
+    this.clearContentFallbackTimer(key);
     const hasFallback =
       opts.fallbackData !== undefined ||
       (typeof opts.fallbackText === "string" && opts.fallbackText.length > 0);
     this.contentSlots.set(key, {
-      status: hasFallback ? status : "failed",
+      status: hasFallback ? "ready" : status === "expired" ? "failed" : status,
       data: opts.fallbackData,
       result: opts.fallbackData,
       text: opts.fallbackText == null ? null : String(opts.fallbackText),
       source: "fallback",
       error,
     });
+  }
+
+  private clearContentFallbackTimer(key: string): void {
+    const timer = this.contentFallbackTimers.get(key);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.contentFallbackTimers.delete(key);
+  }
+
+  private clearAllContentFallbackTimers(): void {
+    for (const timer of this.contentFallbackTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.contentFallbackTimers.clear();
+  }
+
+  private scheduleContentFallback(
+    key: string,
+    opts: Record<string, any>,
+    timeoutMs: number
+  ): void {
+    this.clearContentFallbackTimer(key);
+    const timer = setTimeout(() => {
+      const slot = this.contentSlots.get(key);
+      if (slot?.status === "pending") {
+        this.setFallbackContent(
+          key,
+          opts,
+          "expired",
+          "runtime ai content request timed out"
+        );
+        this.logger.warn(
+          `[sim] runtime ai content expired room=${this.roomKey} id=${key}`
+        );
+      } else {
+        this.contentFallbackTimers.delete(key);
+      }
+    }, timeoutMs + 250);
+    this.contentFallbackTimers.set(key, timer);
   }
 
   private requestRuntimeJudge(key: string, opts: Record<string, any>): void {
@@ -724,6 +768,13 @@ export class SimSession {
       this.setFallbackContent(key, opts, "ready", "runtime ai disabled");
       return;
     }
+    const timeoutMs = Math.max(
+      1000,
+      Math.min(
+        Number(opts.timeoutMs || config.ai.timeoutMs || 12000),
+        config.ai.timeoutMs || 12000
+      )
+    );
     this.contentSlots.set(key, {
       status: "pending",
       data: opts.fallbackData,
@@ -731,6 +782,7 @@ export class SimSession {
       text: opts.fallbackText == null ? null : String(opts.fallbackText),
       source: "fallback",
     });
+    this.scheduleContentFallback(key, opts, timeoutMs);
     void this.resolveRuntimeLane(key, "content", opts);
   }
 
@@ -876,6 +928,7 @@ export class SimSession {
       });
       return;
     }
+    this.clearContentFallbackTimer(key);
     this.contentSlots.set(key, {
       status: "ready",
       data: payload.data !== undefined ? payload.data : raw?.data,
@@ -993,6 +1046,7 @@ export class SimSession {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
+    this.clearAllContentFallbackTimers();
     this.relayClient.close();
     this.logger.info(`[sim] stopped id=${this.id} room=${this.roomKey}`);
   }
@@ -1252,6 +1306,15 @@ export class SimSession {
       setBgm: () => {},
       stopBgm: () => {},
       setVolume: () => {},
+      logAIEvent: (...args: unknown[]) => {
+        if (args.length === 0) return;
+        const message = args
+          .map((arg) =>
+            typeof arg === "string" ? arg : JSON.stringify(arg)
+          )
+          .join(" ");
+        self.logger.debug(`[sim] ai event room=${self.roomKey} ${message}`);
+      },
       bindStream: () => false,
       onStreamEvent: () => {},
       unbindStream: () => {},
@@ -1720,6 +1783,7 @@ export class SimSession {
   }
 
   private callInitState(): void {
+    this.clearAllContentFallbackTimers();
     this.flavorSlots.clear();
     this.judgeSlots.clear();
     this.directorSlots.clear();
